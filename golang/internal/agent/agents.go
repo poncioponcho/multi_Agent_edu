@@ -3,18 +3,21 @@ package agent
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/multi-agent-education/golang/internal/eventbus"
+	"github.com/multi-agent-education/golang/internal/llm"
 	"github.com/multi-agent-education/golang/internal/model"
+	"github.com/multi-agent-education/golang/internal/rag"
 )
 
 // ─── Assessment Agent ───
 
 type AssessmentAgent struct {
-	bus     *eventbus.EventBus
-	Models  map[string]*model.LearnerModel
-	mu      sync.RWMutex
+	bus    *eventbus.EventBus
+	Models map[string]*model.LearnerModel
+	mu     sync.RWMutex
 }
 
 func NewAssessmentAgent(bus *eventbus.EventBus) *AssessmentAgent {
@@ -46,7 +49,8 @@ func (a *AssessmentAgent) handleSubmission(event eventbus.Event) {
 	log.Printf("[Assessment] learner=%s, kp=%s, correct=%v, mastery=%.3f (%s)",
 		event.LearnerID, knowledgeID, isCorrect, state.Mastery, state.Level())
 
-	a.bus.Publish(eventbus.Event{
+	// PublishChild：继承父事件的 CorrelationID，保证整条事件链可追踪
+	a.bus.PublishChild(event, eventbus.Event{
 		Type: eventbus.MasteryUpdated, Source: "AssessmentAgent",
 		LearnerID: event.LearnerID,
 		Data: map[string]interface{}{
@@ -56,14 +60,14 @@ func (a *AssessmentAgent) handleSubmission(event eventbus.Event) {
 	})
 
 	if state.Mastery < 0.3 && state.Attempts >= 3 {
-		a.bus.Publish(eventbus.Event{
+		a.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.WeaknessDetected, Source: "AssessmentAgent",
 			LearnerID: event.LearnerID,
-			Data: map[string]interface{}{"knowledge_id": knowledgeID, "mastery": state.Mastery},
+			Data:      map[string]interface{}{"knowledge_id": knowledgeID, "mastery": state.Mastery},
 		})
 	}
 
-	a.bus.Publish(eventbus.Event{
+	a.bus.PublishChild(event, eventbus.Event{
 		Type: eventbus.AssessmentComplete, Source: "AssessmentAgent",
 		LearnerID: event.LearnerID,
 		Data: map[string]interface{}{
@@ -73,16 +77,34 @@ func (a *AssessmentAgent) handleSubmission(event eventbus.Event) {
 	})
 }
 
-// ─── Tutor Agent ───
+// ─── Tutor Agent（教学 + RAG检索增强 + 可选LLM） ───
 
-type TutorAgent struct {
-	bus      *eventbus.EventBus
-	attempts map[string]int
-	mu       sync.Mutex
+type TutorOption func(*TutorAgent)
+
+// WithRetriever 注入RAG检索器：生成回复前检索教材片段并标注引用
+func WithRetriever(r *rag.BM25) TutorOption {
+	return func(t *TutorAgent) { t.retriever = r }
 }
 
-func NewTutorAgent(bus *eventbus.EventBus) *TutorAgent {
-	return &TutorAgent{bus: bus, attempts: make(map[string]int)}
+// WithLLM 注入LLM客户端：有Key时用LLM生成苏格拉底式回复，失败自动降级模板
+func WithLLM(c *llm.Client) TutorOption {
+	return func(t *TutorAgent) { t.llm = c }
+}
+
+type TutorAgent struct {
+	bus       *eventbus.EventBus
+	attempts  map[string]int
+	retriever *rag.BM25
+	llm       *llm.Client
+	mu        sync.Mutex
+}
+
+func NewTutorAgent(bus *eventbus.EventBus, opts ...TutorOption) *TutorAgent {
+	t := &TutorAgent{bus: bus, attempts: make(map[string]int)}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 func (t *TutorAgent) Start() {
@@ -94,6 +116,7 @@ func (t *TutorAgent) handleAssessment(event eventbus.Event) {
 	knowledgeID, _ := event.Data["knowledge_id"].(string)
 	level, _ := event.Data["level"].(string)
 	isCorrect, _ := event.Data["is_correct"].(bool)
+	mastery, _ := event.Data["mastery"].(float64)
 
 	if !isCorrect {
 		key := event.LearnerID + ":" + knowledgeID
@@ -102,26 +125,21 @@ func (t *TutorAgent) handleAssessment(event eventbus.Event) {
 		attempts := t.attempts[key]
 		t.mu.Unlock()
 		if attempts >= 2 {
-			t.bus.Publish(eventbus.Event{
+			t.bus.PublishChild(event, eventbus.Event{
 				Type: eventbus.HintNeeded, Source: "TutorAgent",
 				LearnerID: event.LearnerID,
 				Data: map[string]interface{}{
 					"knowledge_id": knowledgeID, "attempts": attempts,
-					"mastery": event.Data["mastery"],
+					"mastery": mastery,
 				},
 			})
 			return
 		}
 	}
 
-	var response string
-	if isCorrect {
-		response = fmt.Sprintf("很好！你在「%s」表现不错。你能用自己的话解释一下吗？", knowledgeID)
-	} else {
-		response = fmt.Sprintf("没关系，让我们分析「%s」。你觉得卡在了哪一步？", knowledgeID)
-	}
+	response := t.buildResponse(knowledgeID, isCorrect, mastery)
 
-	t.bus.Publish(eventbus.Event{
+	t.bus.PublishChild(event, eventbus.Event{
 		Type: eventbus.TeachingResponse, Source: "TutorAgent",
 		LearnerID: event.LearnerID,
 		Data: map[string]interface{}{
@@ -129,6 +147,62 @@ func (t *TutorAgent) handleAssessment(event eventbus.Event) {
 			"teaching_style": "socratic", "difficulty_level": level,
 		},
 	})
+}
+
+// buildResponse 生成教学回复：
+//  1. RAG：按知识点名称检索教材片段，注入引用（citation）
+//  2. LLM：有 Key 时基于检索片段生成苏格拉底式回复（低温度，稳定）
+//  3. 降级：LLM 不可用/失败时使用模板回复，保证服务可用
+func (t *TutorAgent) buildResponse(knowledgeID string, isCorrect bool, mastery float64) string {
+	citation := ""
+	if t.retriever != nil {
+		if name, ok := t.knowledgeName(knowledgeID); ok {
+			hits := t.retriever.Search(name, 1)
+			if len(hits) > 0 && hits[0].Score > 0 {
+				citation = fmt.Sprintf("（📖 参考教材《%s》：%s…）",
+					hits[0].Doc.Title, snippet(hits[0].Doc.Content, 55))
+			}
+		}
+	}
+
+	if t.llm != nil {
+		resp, err := t.generateSocratic(knowledgeID, isCorrect, mastery, citation)
+		if err == nil {
+			return resp
+		}
+		log.Printf("[Tutor] LLM failed, fallback to template: %v", err)
+	}
+
+	if isCorrect {
+		return fmt.Sprintf("很好！你在「%s」表现不错。你能用自己的话解释一下吗？%s", knowledgeID, citation)
+	}
+	return fmt.Sprintf("没关系，让我们分析「%s」。你觉得卡在了哪一步？%s", knowledgeID, citation)
+}
+
+// generateSocratic 基于教材片段生成苏格拉底式回复
+func (t *TutorAgent) generateSocratic(knowledgeID string, isCorrect bool, mastery float64, citation string) (string, error) {
+	name := knowledgeID
+	if n, ok := t.knowledgeName(knowledgeID); ok {
+		name = n
+	}
+	system := "你是苏格拉底式教学助教。规则：绝不直接给出答案，只能通过提问引导学生自己思考。" +
+		"回复必须简短（不超过2句话），且以提问结尾。"
+	user := fmt.Sprintf("学生正在学习「%s」，当前掌握度 %.0f%%。学生%s。%s请给出你的引导式回复。",
+		name, mastery*100, map[bool]string{true: "刚刚答对了题目", false: "刚刚答错了题目"}[isCorrect], citation)
+
+	// 教学场景用低温度保证稳定
+	return t.llm.Chat([]llm.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}, 0.4)
+}
+
+func (t *TutorAgent) knowledgeName(knowledgeID string) (string, bool) {
+	n, ok := model.GetKnowledge(knowledgeID)
+	if !ok {
+		return knowledgeID, false
+	}
+	return n.Name, true
 }
 
 func (t *TutorAgent) handleEngagement(event eventbus.Event) {
@@ -142,7 +216,7 @@ func (t *TutorAgent) handleEngagement(event eventbus.Event) {
 		data["message"] = "让我给你一个更有挑战性的问题！"
 	}
 	if len(data) > 0 {
-		t.bus.Publish(eventbus.Event{
+		t.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.DifficultyAdjusted, Source: "TutorAgent",
 			LearnerID: event.LearnerID, Data: data,
 		})
@@ -189,7 +263,7 @@ func (c *CurriculumAgent) handleMasteryUpdate(event eventbus.Event) {
 }
 
 func (c *CurriculumAgent) handleWeakness(event eventbus.Event) {
-	c.bus.Publish(eventbus.Event{
+	c.bus.PublishChild(event, eventbus.Event{
 		Type: eventbus.PathUpdated, Source: "CurriculumAgent",
 		LearnerID: event.LearnerID,
 		Data: map[string]interface{}{
@@ -267,7 +341,7 @@ func (h *HintAgent) handleHintNeeded(event eventbus.Event) {
 
 	log.Printf("[Hint] learner=%s, kp=%s, level=%s", event.LearnerID, knowledgeID, levelName)
 
-	h.bus.Publish(eventbus.Event{
+	h.bus.PublishChild(event, eventbus.Event{
 		Type: eventbus.HintResponse, Source: "HintAgent",
 		LearnerID: event.LearnerID,
 		Data: map[string]interface{}{
@@ -323,7 +397,7 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 	eng := e.getEngagement(event.LearnerID)
 
 	if eng.consecutiveErrors >= 3 {
-		e.bus.Publish(eventbus.Event{
+		e.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.EngagementAlert, Source: "EngagementAgent",
 			LearnerID: event.LearnerID,
 			Data: map[string]interface{}{
@@ -340,7 +414,7 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 		}
 		accuracy := float64(correct) / float64(len(eng.recentResults))
 		if accuracy > 0.9 {
-			e.bus.Publish(eventbus.Event{
+			e.bus.PublishChild(event, eventbus.Event{
 				Type: eventbus.EngagementAlert, Source: "EngagementAgent",
 				LearnerID: event.LearnerID,
 				Data: map[string]interface{}{
@@ -350,7 +424,7 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 			})
 		}
 	} else if eng.consecutiveCorrect >= 3 {
-		e.bus.Publish(eventbus.Event{
+		e.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.Encouragement, Source: "EngagementAgent",
 			LearnerID: event.LearnerID,
 			Data: map[string]interface{}{
@@ -369,4 +443,32 @@ func (e *EngagementAgent) getEngagement(learnerID string) *learnerEngagement {
 		e.engagements[learnerID] = eng
 	}
 	return eng
+}
+
+// snippet 截取文档片段（按rune，避免截断中文）
+func snippet(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n])
+}
+
+// ContainsGuidedQuestion 判断回复是否为引导式提问（供评测与前端使用）：
+// 以问号结尾或包含引导性措辞，且不含直接给答案的表述
+func ContainsGuidedQuestion(response string) bool {
+	// 直接给答案的标记（否决项）：教材公式中的 "=" 不算，需带上下文
+	directMarkers := []string{"答案是", "答案为", "结果等于", "结果为", "顶点是", "的解是", "正确答案是"}
+	for _, m := range directMarkers {
+		if strings.Contains(response, m) {
+			return false
+		}
+	}
+	guideMarkers := []string{"？", "?", "你觉得", "想一想", "试着", "卡在", "回忆", "解释一下", "能不能"}
+	for _, m := range guideMarkers {
+		if strings.Contains(response, m) {
+			return true
+		}
+	}
+	return false
 }

@@ -7,6 +7,8 @@ import (
 	"github.com/multi-agent-education/golang/internal/agent"
 	"github.com/multi-agent-education/golang/internal/api"
 	"github.com/multi-agent-education/golang/internal/eventbus"
+	"github.com/multi-agent-education/golang/internal/llm"
+	"github.com/multi-agent-education/golang/internal/rag"
 )
 
 // 多Agent智能教育系统 - Go版入口
@@ -16,22 +18,31 @@ import (
 func main() {
 	bus := eventbus.New()
 
+	// 初始化RAG检索器与LLM客户端（无API Key时LLM为nil，Tutor自动降级模板回复）
+	retriever := rag.NewRetriever()
+	llmClient := llm.NewClientFromEnv()
+	if llmClient == nil {
+		log.Println("[LLM] no API key, Tutor will use template responses")
+	} else {
+		log.Println("[LLM] API key detected, Tutor will use LLM + RAG")
+	}
+
 	// 初始化5个Agent，每个Agent在独立的goroutine中运行
 	assessmentAgent := agent.NewAssessmentAgent(bus)
-	tutorAgent := agent.NewTutorAgent(bus)
+	tutorAgent := agent.NewTutorAgent(bus, agent.WithRetriever(retriever), agent.WithLLM(llmClient))
 	curriculumAgent := agent.NewCurriculumAgent(bus)
 	hintAgent := agent.NewHintAgent(bus)
 	engagementAgent := agent.NewEngagementAgent(bus)
 
-	// 启动所有Agent的事件监听
-	go assessmentAgent.Start()
-	go tutorAgent.Start()
-	go curriculumAgent.Start()
-	go hintAgent.Start()
-	go engagementAgent.Start()
+	// 注册所有Agent的事件订阅（Start仅Subscribe，纯内存操作，同步执行避免订阅竞态）
+	assessmentAgent.Start()
+	tutorAgent.Start()
+	curriculumAgent.Start()
+	hintAgent.Start()
+	engagementAgent.Start()
 
 	// 启动HTTP服务
-	router := api.SetupRouter(bus, assessmentAgent)
+	router := api.SetupRouter(bus, assessmentAgent, retriever)
 	log.Println("Go Agent Education Server starting on :8081")
 	if err := http.ListenAndServe(":8081", router); err != nil {
 		log.Fatal(err)

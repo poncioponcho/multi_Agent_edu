@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"sync"
@@ -12,32 +13,40 @@ import (
 type EventType string
 
 const (
-	StudentSubmission EventType = "student.submission"
-	StudentQuestion   EventType = "student.question"
-	StudentMessage    EventType = "student.message"
+	StudentSubmission  EventType = "student.submission"
+	StudentQuestion    EventType = "student.question"
+	StudentMessage     EventType = "student.message"
 	AssessmentComplete EventType = "assessment.complete"
-	MasteryUpdated    EventType = "assessment.mastery_updated"
-	WeaknessDetected  EventType = "assessment.weakness_detected"
-	TeachingResponse  EventType = "tutor.teaching_response"
-	HintNeeded        EventType = "tutor.hint_needed"
+	MasteryUpdated     EventType = "assessment.mastery_updated"
+	WeaknessDetected   EventType = "assessment.weakness_detected"
+	TeachingResponse   EventType = "tutor.teaching_response"
+	HintNeeded         EventType = "tutor.hint_needed"
 	DifficultyAdjusted EventType = "tutor.difficulty_adjusted"
-	PathUpdated       EventType = "curriculum.path_updated"
-	ReviewScheduled   EventType = "curriculum.review_scheduled"
-	NextTopic         EventType = "curriculum.next_topic"
-	HintResponse      EventType = "hint.response"
-	EngagementAlert   EventType = "engagement.alert"
-	Encouragement     EventType = "engagement.encouragement"
-	PaceAdjustment    EventType = "engagement.pace_adjustment"
+	PathUpdated        EventType = "curriculum.path_updated"
+	ReviewScheduled    EventType = "curriculum.review_scheduled"
+	NextTopic          EventType = "curriculum.next_topic"
+	HintResponse       EventType = "hint.response"
+	EngagementAlert    EventType = "engagement.alert"
+	Encouragement      EventType = "engagement.encouragement"
+	PaceAdjustment     EventType = "engagement.pace_adjustment"
 )
+
+// MaxHops 事件链最大跳数 -- 防活锁：超过即丢弃
+const MaxHops = 8
+
+// MaxSeenEntries seen 表容量上限，超过触发过期清理
+const MaxSeenEntries = 5000
 
 // Event 事件数据结构
 type Event struct {
-	ID        string                 `json:"id"`
-	Type      EventType              `json:"type"`
-	Source    string                 `json:"source"`
-	LearnerID string                `json:"learner_id"`
-	Timestamp time.Time             `json:"timestamp"`
-	Data      map[string]interface{} `json:"data"`
+	ID            string                 `json:"id"`
+	CorrelationID string                 `json:"correlation_id"` // 全链路追踪ID：同一事件链共享
+	Hops          int                    `json:"hops"`           // 当前传播跳数
+	Type          EventType              `json:"type"`
+	Source        string                 `json:"source"`
+	LearnerID     string                 `json:"learner_id"`
+	Timestamp     time.Time              `json:"timestamp"`
+	Data          map[string]interface{} `json:"data"`
 }
 
 // Handler 事件处理函数
@@ -45,14 +54,16 @@ type Handler func(Event)
 
 // EventBus 事件总线 -- Go版使用channel实现
 //
-// 面试要点：
-// - Go channel vs Python asyncio: channel是CSP模型，asyncio是协程模型
-// - channel天然支持多生产者多消费者
-// - select语句可以同时监听多个channel
+// 生产级增强（本次迭代）：
+//  1. 全链路追踪：CorrelationID 在事件链中透传，支持按链路回放（GetTrace）
+//  2. 防活锁：Hops 超过 MaxHops 的事件被丢弃，防止 Agent 互相触发形成无限循环
+//  3. 事件去重：同一 CorrelationID 下相同类型的事件只处理一次，防止事件风暴
 type EventBus struct {
 	subscribers map[EventType][]Handler
 	eventChan   chan Event
 	history     []Event
+	seen        map[string]time.Time // dedupKey(correlationID|type) -> 首次时间
+	dropped     int64                // 被丢弃的事件数（防活锁+去重）
 	mu          sync.RWMutex
 }
 
@@ -60,8 +71,9 @@ type EventBus struct {
 func New() *EventBus {
 	bus := &EventBus{
 		subscribers: make(map[EventType][]Handler),
-		eventChan:   make(chan Event, 1000), // 缓冲channel，防止阻塞
+		eventChan:   make(chan Event, 1000),
 		history:     make([]Event, 0),
+		seen:        make(map[string]time.Time),
 	}
 	go bus.dispatch()
 	return bus
@@ -75,19 +87,71 @@ func (b *EventBus) Subscribe(eventType EventType, handler Handler) {
 }
 
 // Publish 发布事件（非阻塞，写入channel）
-func (b *EventBus) Publish(event Event) {
+// 返回值是注入追踪字段后的事件，便于调用方读取生成的 CorrelationID
+func (b *EventBus) Publish(event Event) Event {
 	if event.ID == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		event.ID = fmt.Sprintf("%x", b)
+		event.ID = newID()
 	}
+	if event.CorrelationID == "" {
+		event.CorrelationID = event.ID
+	}
+	event.Hops++
 	event.Timestamp = time.Now()
 
+	// ── 防活锁：跳数上限 ──
+	if event.Hops > MaxHops {
+		b.mu.Lock()
+		b.dropped++
+		b.mu.Unlock()
+		log.Printf("[EventBus] DROP livelock: correlation=%s hops=%d type=%s",
+			event.CorrelationID, event.Hops, event.Type)
+		return event
+	}
+
+	// ── 事件去重：同一事件链内同类型只处理一次 ──
+	dedupKey := event.CorrelationID + "|" + string(event.Type)
 	b.mu.Lock()
+	if _, dup := b.seen[dedupKey]; dup {
+		b.dropped++
+		b.mu.Unlock()
+		log.Printf("[EventBus] DROP duplicate: correlation=%s type=%s", event.CorrelationID, event.Type)
+		return event
+	}
+	b.seen[dedupKey] = time.Now()
+	b.cleanSeenLocked()
 	b.history = append(b.history, event)
 	b.mu.Unlock()
 
 	b.eventChan <- event
+	return event
+}
+
+// PublishChild 由 Agent 内部转发事件时使用：继承父事件的 CorrelationID 与跳数，
+// 使整条事件链可被追踪，同时受 MaxHops 保护
+func (b *EventBus) PublishChild(parent Event, child Event) Event {
+	child.CorrelationID = parent.CorrelationID
+	child.Hops = parent.Hops
+	return b.Publish(child)
+}
+
+// cleanSeenLocked 清理超过5分钟的去重记录（调用方需持有写锁）
+func (b *EventBus) cleanSeenLocked() {
+	if len(b.seen) < MaxSeenEntries {
+		return
+	}
+	cutoff := time.Now().Add(-5 * time.Minute)
+	for k, t := range b.seen {
+		if t.Before(cutoff) {
+			delete(b.seen, k)
+		}
+	}
+}
+
+// DroppedCount 返回因防活锁/去重丢弃的事件数
+func (b *EventBus) DroppedCount() int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.dropped
 }
 
 // dispatch 事件分发goroutine
@@ -97,7 +161,8 @@ func (b *EventBus) dispatch() {
 		handlers := b.subscribers[event.Type]
 		b.mu.RUnlock()
 
-		log.Printf("[EventBus] %s -> %s (learner=%s)", event.Source, event.Type, event.LearnerID)
+		log.Printf("[EventBus] %s -> %s (learner=%s, corr=%s, hops=%d)",
+			event.Source, event.Type, event.LearnerID, shortID(event.CorrelationID), event.Hops)
 
 		for _, handler := range handlers {
 			// 每个handler在独立goroutine中执行
@@ -128,4 +193,36 @@ func (b *EventBus) GetHistory(learnerID string, limit int) []Event {
 		filtered = filtered[len(filtered)-limit:]
 	}
 	return filtered
+}
+
+// GetTrace 按 CorrelationID 回放完整事件链 -- 全链路追踪的核心能力
+func (b *EventBus) GetTrace(correlationID string) []Event {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var trace []Event
+	for _, e := range b.history {
+		if e.CorrelationID == correlationID {
+			trace = append(trace, e)
+		}
+	}
+	return trace
+}
+
+func newID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+// String 便于日志输出
+func (e Event) String() string {
+	return fmt.Sprintf("%s[%s]", e.Type, e.Source)
 }

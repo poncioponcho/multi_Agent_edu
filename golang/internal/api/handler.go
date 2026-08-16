@@ -6,10 +6,12 @@ import (
 
 	"github.com/multi-agent-education/golang/internal/agent"
 	"github.com/multi-agent-education/golang/internal/eventbus"
+	"github.com/multi-agent-education/golang/internal/model"
+	"github.com/multi-agent-education/golang/internal/rag"
 )
 
 // SetupRouter 配置HTTP路由
-func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent) http.Handler {
+func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retriever *rag.BM25) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +74,49 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent) http
 		writeJSON(w, map[string]interface{}{"learner_id": learnerID, "events": events})
 	})
 
+	// 全链路追踪：按 correlation_id 回放完整事件链
+	mux.HandleFunc("GET /api/v1/trace/{correlationID}", func(w http.ResponseWriter, r *http.Request) {
+		trace := bus.GetTrace(r.PathValue("correlationID"))
+		writeJSON(w, map[string]interface{}{"correlation_id": r.PathValue("correlationID"), "trace": trace})
+	})
+
+	// RAG 检索：按知识点名称检索教材片段
+	mux.HandleFunc("GET /api/v1/retrieve", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			http.Error(w, "missing query param q", http.StatusBadRequest)
+			return
+		}
+		topK := 3
+		if retriever == nil {
+			writeJSON(w, map[string]interface{}{"error": "retriever not configured"})
+			return
+		}
+		hits := retriever.Search(query, topK)
+		writeJSON(w, map[string]interface{}{"query": query, "hits": hits})
+	})
+
+	// 学习路径推荐：基于掌握度推荐可学知识点（前置已达标）
+	mux.HandleFunc("GET /api/v1/next-topics/{learnerID}", func(w http.ResponseWriter, r *http.Request) {
+		learnerID := r.PathValue("learnerID")
+		m := assessment.GetModel(learnerID)
+		mastery := make(map[string]float64)
+		for _, id := range knowledgeIDs() {
+			mastery[id] = m.GetState(id).Mastery
+		}
+		next := model.RecommendNext(mastery)
+		writeJSON(w, map[string]interface{}{"learner_id": learnerID, "next_topics": next})
+	})
+
 	return withCORS(mux)
+}
+
+func knowledgeIDs() []string {
+	ids := make([]string, 0, len(model.KnowledgeGraph))
+	for _, n := range model.KnowledgeGraph {
+		ids = append(ids, n.ID)
+	}
+	return ids
 }
 
 func writeJSON(w http.ResponseWriter, data interface{}) {

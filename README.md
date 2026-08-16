@@ -1,9 +1,9 @@
 # 🎓 多Agent智能教育与个性化学习系统
 
-> **Python + Go 双语言实现 | 企业级 Mesh + 事件驱动架构**
+> **Go + Python 双语言实现 | 企业级 Mesh + 事件驱动架构 | 零依赖 Go 版**
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](python/)
 [![Go](https://img.shields.io/badge/Go-1.22+-cyan.svg)](golang/)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](python/)
 [![React](https://img.shields.io/badge/React-18+-purple.svg)](frontend/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -19,11 +19,11 @@
 
 核心设计目标：**从"千人一面的网课"到"根据每个学生的薄弱点实时调整的教学系统"**。
 
+**Go 版亮点**：全部基于标准库实现（BM25 检索器、MCP Server、LLM 客户端均为手写，零第三方依赖），并具备**全链路追踪、防活锁、Agent 评测框架、RAG 检索增强、MCP 协议接入**五项生产级能力，实测指标见下文。
+
 ---
 
 ## 🏗️ 系统架构
-
-### 整体架构图
 
 ```
                     ┌──────────────────────────┐
@@ -62,7 +62,7 @@
 | Agent | 职责 | 核心算法/技术 |
 |-------|------|---------------|
 | **Assessment Agent (评估)** | 知识点掌握度评估、学习路径诊断 | 贝叶斯知识追踪(BKT)、Beta分布 |
-| **Tutor Agent (教学)** | 苏格拉底式提问教学，动态调整难度 | Prompt Engineering、难度自适应 |
+| **Tutor Agent (教学)** | 苏格拉底式提问教学，动态调整难度 | RAG检索增强、Prompt Engineering、难度自适应 |
 | **Curriculum Agent (课程)** | 动态生成学习路径，间隔重复排期 | SM-2算法、知识图谱拓扑排序 |
 | **Hint Agent (提示)** | 分级提示：暗示→引导→直接答案 | 三级提示策略、尝试次数分析 |
 | **Engagement Agent (互动)** | 监测学习状态，适时鼓励、调整节奏 | 情感分析、响应时间分析 |
@@ -81,89 +81,71 @@
 - Agent 之间是**双向、异步、事件驱动**的，不是简单的串行调用
 - 新增 Agent 只需订阅事件，无需修改现有代码（**开闭原则**）
 
-### 核心事件流
-
-```
-学生答题
-  → STUDENT_SUBMISSION 事件
-  → Assessment Agent 处理
-      → MASTERY_UPDATED 事件
-          → Curriculum Agent（更新SM-2复习计划）
-      → ASSESSMENT_COMPLETE 事件
-          → Tutor Agent（生成苏格拉底式回复）
-          → Engagement Agent（分析学习状态）
-  → Engagement Agent 并行处理
-      → 如果检测到挫败 → ENGAGEMENT_ALERT 事件
-          → Tutor Agent（降低难度）
-          → Curriculum Agent（放慢节奏）
-```
-
 ---
 
-## 📂 项目结构
+## ⚡ Go 版生产级能力（v2.0）
+
+### 全链路追踪 + 防活锁
+
+EventBus 增加 `correlation_id` 透传（Agent 间转发自动继承）、事件最大跳数限制（防活锁）与去重（防事件风暴）：
 
 ```
-multi-agent-education/
-│
-├── 📄 README.md              ← 项目说明
-├── 📄 LICENSE                ← MIT 开源协议
-├── 📄 docker-compose.yml     ← 一键启动全部服务
-├── 📄 .env.example           ← 环境变量模板（不含真实密钥）
-│
-├── 📁 docs/                  ← 架构与部署文档
-│   ├── architecture.md       ← 架构设计详解
-│   ├── knowledge-points.md   ← 知识图谱知识点体系
-│   └── deployment.md         ← 部署指南
-│
-├── 📁 python/                ← 🐍 Python 实现（AI 生态最丰富）
-│   ├── README.md
-│   ├── agents/               ← 5个Agent实现
-│   ├── core/                 ← 核心模块（事件总线、BKT、SM-2、知识图谱、LLM客户端）
-│   ├── api/                  ← FastAPI + WebSocket
-│   ├── config/               ← 配置管理
-│   └── tests/                ← 单元与集成测试
-│
-├── 📁 golang/                ← 🔷 Go 实现（goroutine + channel）
-│   ├── README.md
-│   └── internal/             ← agent / eventbus / model / api
-│
-└── 📁 frontend/              ← ⚛️ React 前端（两个后端通用）
-    ├── package.json
-    └── src/
+GET /api/v1/trace/{correlationID}   # 回放完整事件链
 ```
+
+覆盖测试：活锁循环截断 ✅ 事件去重 ✅ 链路回放 ✅ handler panic 隔离 ✅
+
+### Agent 评测框架（实测数据）
+
+18 个黄金用例（含多轮序列：提示级别升级、挫败/厌倦干预）走真实 EventBus 全链路评测：
+
+| 指标 | 实测值 |
+|------|--------|
+| 用例通过率 | 18/18 (100%) |
+| 引导率（非直接给答案） | 100% |
+| 提示级别准确率（level1→2→2→3） | 100% (4/4) |
+| 干预准确率（挫败降难度/厌倦提难度） | 100% (2/2) |
+| 平均对话轮数（到达掌握） | 3.0 轮 |
+
+### RAG 检索增强 + 可选 LLM
+
+- 纯标准库 BM25 检索器（中文 unigram+bigram 切词），内置 8 篇教材文档
+- Tutor 回复自动注入教材引用（📖 可溯源）；配置 `OPENAI_API_KEY` 后自动切换"检索 + LLM 生成"，失败降级模板
+
+### MCP Server（零依赖实现）
+
+纯标准库实现 MCP 协议（JSON-RPC 2.0 + stdio），3 个工具：`query_knowledge_graph`（知识图谱查询）、`calculate`（安全数学求值，自研解析器）、`retrieve_textbook`（RAG 检索）。
 
 ---
 
 ## 🚀 快速开始
 
-### 方式一：Docker 一键启动（全部服务）
+### Go 版（推荐）
+
+```bash
+cd golang
+go run cmd/main.go          # HTTP 服务 :8081（无第三方依赖，直接可跑）
+go run cmd/eval/main.go     # 运行 Agent 评测（18 用例）
+go run cmd/mcp/main.go      # 启动 MCP Server (stdio)
+go test ./...               # 全部测试
+```
+
+### Docker 一键启动（Python 版 + 前端 + 数据库）
 
 ```bash
 docker-compose up -d
-
 # 前端：http://localhost:3000
 # Python API：http://localhost:8000/docs
 ```
 
-### 方式二：Python 版（推荐）
+### Python 版
 
 ```bash
 cd python
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp ../.env.example ../.env   # 填入你的 LLM API Key
-python -m api.main
-# 打开 http://localhost:8000/docs 查看 API 文档
-```
-
-### 方式三：Go 版
-
-```bash
-cd golang
-go mod tidy
-go run cmd/main.go
-# 访问 http://localhost:8081/api/v1/health
+cp ../.env.example ../.env   # 填入 LLM API Key
+python -m api.main           # http://localhost:8000/docs
 ```
 
 ---
@@ -173,30 +155,21 @@ go run cmd/main.go
 ### 1. SM-2 间隔重复算法（Curriculum Agent）
 
 ```
-复习间隔计算：
-  I(1) = 1 天（第1次复习）
-  I(2) = 6 天（第2次复习）
-  I(n) = I(n-1) × EF（之后每次间隔 = 上次间隔 × 难度因子）
-
-难度因子更新：
-  EF' = EF - 0.8 + 0.28 × q - 0.02 × q²   （q 为回答质量 0-5 分）
+复习间隔：I(1)=1天, I(2)=6天, I(n)=I(n-1)×EF
+难度因子：EF' = EF - 0.8 + 0.28×q - 0.02×q²   （q 为回答质量 0-5 分）
 ```
 
-代码位置：[python/core/spaced_repetition.py](python/core/spaced_repetition.py)
+代码位置：[golang/internal/model/learner.go](golang/internal/model/learner.go)
 
 ### 2. 贝叶斯知识追踪 BKT（Assessment Agent）
 
 ```
-四个核心参数：
-  P(L₀) = 初始掌握概率    P(T) = 学习转移概率
-  P(G)  = 猜测概率        P(S) = 失误概率
-
-更新公式（贝叶斯后验）：
-  答对: P(Lₙ|correct) = P(Lₙ₋₁) × (1 - P(S)) / P(correct)
-  答错: P(Lₙ|wrong)   = P(Lₙ₋₁) × P(S) / P(wrong)
+参数：P(L₀)先验、P(T)学习转移、P(G)猜测、P(S)失误
+答对: P(Lₙ|correct) = P(Lₙ₋₁)×(1-P(S)) / P(correct)
+答错: P(Lₙ|wrong)   = P(Lₙ₋₁)×P(S) / P(wrong)
 ```
 
-代码位置：[python/core/learner_model.py](python/core/learner_model.py)
+代码位置：[golang/internal/model/learner.go](golang/internal/model/learner.go)
 
 ### 3. 苏格拉底式教学（Tutor Agent）
 
@@ -204,30 +177,27 @@ go run cmd/main.go
 
 ```
 学生："二次函数 y = x² + 2x + 1 的顶点在哪里？"
-
-❌ 直接给答案："顶点是 (-1, 0)"
-
-✅ 苏格拉底式引导：
-  第1轮："你知道二次函数的顶点公式吗？或者，你能把这个式子配方吗？"
+✅ 第1轮："你知道二次函数的顶点公式吗？或者，你能把这个式子配方吗？"
   第2轮："很好！你配成了 y = (x+1)²，那 (x+1)² 最小值是多少？"
   第3轮："对了！所以顶点坐标是？"
 ```
 
-代码位置：[python/agents/tutor_agent.py](python/agents/tutor_agent.py)
+代码位置：[golang/internal/agent/agents.go](golang/internal/agent/agents.go)
 
 ---
 
-## 🔧 技术栈与双语言对比
+## 🔧 双语言对比
 
-| 维度 | Python | Go |
-|------|--------|-----|
-| **框架** | LangGraph + FastAPI | Gin/标准库 |
-| **Agent编排** | StateGraph 状态机 | goroutine + channel |
-| **事件总线** | asyncio + pub/sub | Go channel (CSP) |
-| **WebSocket** | FastAPI WebSocket | gorilla/websocket |
-| **数据库** | SQLAlchemy + asyncpg | GORM |
-| **并发模型** | 协程（I/O密集型） | goroutine 仅4KB（高并发） |
-| **适合场景** | AI/ML 生态最丰富 | 高并发、低延迟 |
+| 维度 | Go（零依赖） | Python |
+|------|--------------|--------|
+| **HTTP** | 标准库 net/http | FastAPI |
+| **Agent编排** | goroutine + channel (CSP) | LangGraph StateGraph |
+| **事件总线** | channel + 手写 trace/防活锁 | asyncio + pub/sub |
+| **RAG** | 手写 BM25（标准库） | LangChain 生态 |
+| **MCP** | 手写 JSON-RPC Server | 生态库 |
+| **LLM** | 手写 OpenAI 兼容客户端 | openai SDK |
+| **并发模型** | goroutine 仅 4KB | 协程（I/O 密集） |
+| **适合场景** | 高并发、低延迟、深度定制 | AI 生态丰富、快速迭代 |
 
 ### 架构参考
 
@@ -242,9 +212,9 @@ go run cmd/main.go
 
 ## 📚 学习路线
 
-1. **理解原理**：阅读 [docs/architecture.md](docs/architecture.md) 了解架构设计，理解 SM-2 与 BKT 核心公式
-2. **看懂代码**：从 [python/core/event_bus.py](python/core/event_bus.py) 开始，逐个阅读 5 个 Agent，运行测试 `python -m pytest tests/`
-3. **动手修改**：添加新知识点到知识图谱、修改苏格拉底式 Prompt 模板、调整 SM-2 参数观察效果
+1. **理解原理**：阅读 [docs/architecture.md](docs/architecture.md)，理解 SM-2 与 BKT 核心公式
+2. **看懂代码**：Go 版从 [internal/eventbus/eventbus.go](golang/internal/eventbus/eventbus.go) 开始，逐个阅读 5 个 Agent，运行 `go test ./...`
+3. **动手修改**：修改苏格拉底式 Prompt 模板、调整 SM-2 参数、给评测集新增用例（`internal/eval/eval.go`）
 
 ---
 
