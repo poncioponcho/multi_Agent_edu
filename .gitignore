@@ -1,0 +1,57 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Java
+target/
+*.class
+*.jar
+*.war
+*.ear
+.idea/
+*.iml
+
+# Go
+bin/
+vendor/
+
+# Node / React
+node_modules/
+frontend/build/
+frontend/dist/
+.next/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Database
+*.db
+*.sqlite3
+
+# WorkBuddy workspace data
+.workbuddy/

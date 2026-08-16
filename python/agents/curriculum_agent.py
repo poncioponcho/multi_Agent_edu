@@ -1,0 +1,167 @@
+"""
+Curriculum Agent（课程Agent）-- 动态学习路径规划与间隔重复排期。
+
+核心职责：
+1. 基于知识图谱拓扑排序规划学习路径
+2. 使用SM-2算法安排复习时间
+3. 检查前置知识是否达标再推进新内容
+
+面试要点：
+- 为什么学习路径要动态生成？每个学生进度不同，固定路径不够个性化
+- SM-2 vs Leitner 系统：SM-2更精细，连续调整间隔
+- 拓扑排序保证学习顺序：前置知识必须先掌握
+"""
+
+import logging
+
+from .base_agent import BaseAgent
+from core.event_bus import Event, EventType
+from core.knowledge_graph import KnowledgeGraph, build_sample_math_graph
+from core.spaced_repetition import SpacedRepetition, ReviewItem
+
+logger = logging.getLogger(__name__)
+
+MASTERY_THRESHOLD = 0.6
+
+
+class CurriculumAgent(BaseAgent):
+    """课程Agent：动态规划学习路径 + 间隔重复排期。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.knowledge_graph: KnowledgeGraph = build_sample_math_graph()
+        self.sr = SpacedRepetition()
+        self._review_items: dict[str, dict[str, ReviewItem]] = {}
+
+    @property
+    def subscribed_events(self) -> list[EventType]:
+        return [
+            EventType.MASTERY_UPDATED,
+            EventType.WEAKNESS_DETECTED,
+            EventType.PACE_ADJUSTMENT,
+        ]
+
+    async def handle_event(self, event: Event) -> None:
+        if event.type == EventType.MASTERY_UPDATED:
+            await self._handle_mastery_update(event)
+        elif event.type == EventType.WEAKNESS_DETECTED:
+            await self._handle_weakness(event)
+        elif event.type == EventType.PACE_ADJUSTMENT:
+            await self._handle_pace_adjustment(event)
+
+    async def _handle_mastery_update(self, event: Event) -> None:
+        """mastery更新时，更新复习计划 + 检查是否可以推进新知识点。"""
+        learner_id = event.learner_id
+        knowledge_id = event.data.get("knowledge_id", "")
+        mastery = event.data.get("mastery", 0.0)
+
+        quality = self._mastery_to_quality(mastery)
+        review_item = self._get_review_item(learner_id, knowledge_id)
+        self.sr.review(review_item, quality)
+
+        if mastery >= MASTERY_THRESHOLD:
+            await self._check_and_recommend_next(learner_id)
+
+        await self._send_review_schedule(learner_id)
+
+    def _mastery_to_quality(self, mastery: float) -> int:
+        """将mastery概率映射到SM-2的quality评分 (0-5)。"""
+        if mastery >= 0.9:
+            return 5
+        elif mastery >= 0.75:
+            return 4
+        elif mastery >= 0.6:
+            return 3
+        elif mastery >= 0.4:
+            return 2
+        elif mastery >= 0.2:
+            return 1
+        return 0
+
+    def _get_review_item(self, learner_id: str, knowledge_id: str) -> ReviewItem:
+        """获取或创建复习条目。"""
+        if learner_id not in self._review_items:
+            self._review_items[learner_id] = {}
+        items = self._review_items[learner_id]
+        if knowledge_id not in items:
+            items[knowledge_id] = ReviewItem(knowledge_id=knowledge_id)
+        return items[knowledge_id]
+
+    async def _check_and_recommend_next(self, learner_id: str) -> None:
+        """检查是否有新的可学知识点推荐。"""
+        model = self.get_learner_model(learner_id)
+        mastered_ids = {
+            s.knowledge_id
+            for s in model.knowledge_states.values()
+            if s.mastery >= MASTERY_THRESHOLD
+        }
+
+        ready = self.knowledge_graph.get_ready_nodes(mastered_ids)
+        if ready:
+            next_topic = ready[0]
+            node = self.knowledge_graph.nodes.get(next_topic)
+            await self.emit(
+                EventType.NEXT_TOPIC,
+                learner_id,
+                {
+                    "knowledge_id": next_topic,
+                    "name": node.name if node else next_topic,
+                    "difficulty": node.difficulty if node else 0.5,
+                    "reason": "前置知识已掌握，推荐学习新内容",
+                    "alternatives": ready[1:4],
+                },
+            )
+
+    async def _send_review_schedule(self, learner_id: str) -> None:
+        """发送复习计划。"""
+        items = list(self._review_items.get(learner_id, {}).values())
+        due_items = self.sr.get_due_items(items)
+        schedule = self.sr.get_study_schedule(items, days_ahead=7)
+
+        if due_items:
+            await self.emit(
+                EventType.REVIEW_SCHEDULED,
+                learner_id,
+                {
+                    "due_now": [
+                        {"knowledge_id": item.knowledge_id, "overdue_days": round(item.overdue_days, 1)}
+                        for item in due_items[:5]
+                    ],
+                    "weekly_schedule": schedule,
+                },
+            )
+
+    async def _handle_weakness(self, event: Event) -> None:
+        """处理薄弱知识点，规划补救路径。"""
+        learner_id = event.learner_id
+        knowledge_id = event.data.get("knowledge_id", "")
+
+        model = self.get_learner_model(learner_id)
+        mastered_ids = {
+            s.knowledge_id
+            for s in model.knowledge_states.values()
+            if s.mastery >= MASTERY_THRESHOLD
+        }
+
+        remedial_path = self.knowledge_graph.get_learning_path(knowledge_id, mastered_ids)
+
+        await self.emit(
+            EventType.PATH_UPDATED,
+            learner_id,
+            {
+                "reason": "weakness_detected",
+                "weak_knowledge_id": knowledge_id,
+                "remedial_path": remedial_path,
+                "message": f"检测到「{knowledge_id}」薄弱，建议先复习前置知识",
+            },
+        )
+
+    async def _handle_pace_adjustment(self, event: Event) -> None:
+        """响应Engagement Agent的节奏调整请求。"""
+        action = event.data.get("action", "")
+        learner_id = event.learner_id
+
+        if action == "slow_down":
+            logger.info("[CurriculumAgent] Slowing down pace for learner %s", learner_id)
+        elif action == "speed_up":
+            logger.info("[CurriculumAgent] Speeding up pace for learner %s", learner_id)
