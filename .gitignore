@@ -55,3 +55,4 @@ docker-compose.override.yml
 
 # WorkBuddy workspace data
 .workbuddy/
+.workbuddy-ai/
