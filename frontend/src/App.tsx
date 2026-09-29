@@ -1,5 +1,7 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
+import 'katex/dist/katex.min.css'
 import { useWebSocket, AgentEvent } from './hooks/useWebSocket'
+import { renderRichText } from './utils/renderMath'
 
 const AGENT_COLORS: Record<string, string> = {
   AssessmentAgent: '#3b82f6',
@@ -8,6 +10,37 @@ const AGENT_COLORS: Record<string, string> = {
   HintAgent: '#8b5cf6',
   EngagementAgent: '#ef4444',
   api: '#6b7280',
+}
+
+// Agent 中文名（面试演示用，非技术观众也能看懂）
+const AGENT_LABELS: Record<string, string> = {
+  AssessmentAgent: '评估 Agent（BKT 掌握度）',
+  TutorAgent: '教学 Agent（苏格拉底式）',
+  CurriculumAgent: '课程 Agent（SM-2 排期）',
+  HintAgent: '提示 Agent（分级提示）',
+  EngagementAgent: '互动 Agent（节奏监控）',
+}
+
+// 知识点 key → 中文名（避免界面暴露内部 ID）
+const KNOWLEDGE_NAMES: Record<string, string> = {
+  arithmetic: '四则运算',
+  fractions: '分数运算',
+  algebraic_expr: '代数式',
+  linear_eq_1: '一元一次方程',
+  factoring: '因式分解',
+  quadratic_eq: '一元二次方程',
+  quadratic_func: '二次函数',
+  pythagorean: '勾股定理',
+  probability: '概率初步',
+}
+
+// 把文本中出现的知识点 key 替换为中文名
+function localize(text: string): string {
+  let result = text
+  for (const [key, name] of Object.entries(KNOWLEDGE_NAMES)) {
+    result = result.replace(new RegExp(`\\b${key}\\b`, 'g'), name)
+  }
+  return result
 }
 
 function EventCard({ event }: { event: AgentEvent }) {
@@ -24,21 +57,30 @@ function EventCard({ event }: { event: AgentEvent }) {
         <strong style={{ color }}>{event.source}</strong>
         <span style={{ fontSize: 12, color: '#999' }}>{event.event_type}</span>
       </div>
-      {event.data.response && (
-        <p style={{ margin: 0 }}>{String(event.data.response)}</p>
+      {!!event.data.response && (
+        <p
+          style={{ margin: 0, lineHeight: 1.7 }}
+          dangerouslySetInnerHTML={{ __html: renderRichText(localize(String(event.data.response))) }}
+        />
       )}
-      {event.data.message && (
-        <p style={{ margin: 0 }}>{String(event.data.message)}</p>
+      {!!event.data.message && (
+        <p
+          style={{ margin: 0, lineHeight: 1.7 }}
+          dangerouslySetInnerHTML={{ __html: renderRichText(localize(String(event.data.message))) }}
+        />
       )}
       {event.data.mastery !== undefined && (
         <div style={{ marginTop: 4 }}>
           <span>掌握度: </span>
-          <strong>{(Number(event.data.mastery) * 100).toFixed(1)}%</strong>
-          {event.data.level && <span> ({String(event.data.level)})</span>}
+          <strong>{(Number(event.data.mastery) * 100).toFixed(0)}%</strong>
+          {!!event.data.level && <span> ({String(event.data.level)})</span>}
         </div>
       )}
-      {event.data.hint_text && (
-        <p style={{ margin: '4px 0 0', fontStyle: 'italic' }}>{String(event.data.hint_text)}</p>
+      {!!event.data.hint_text && (
+        <p
+          style={{ margin: '4px 0 0', fontStyle: 'italic', lineHeight: 1.7 }}
+          dangerouslySetInnerHTML={{ __html: renderRichText(localize(String(event.data.hint_text))) }}
+        />
       )}
     </div>
   )
@@ -49,6 +91,30 @@ export default function App() {
   const { events, connected, send } = useWebSocket(learnerId)
   const [knowledgeId, setKnowledgeId] = useState('quadratic_eq')
   const [message, setMessage] = useState('')
+  // 提问后 LLM 推理中：显示"思考中"指示，收到 Agent 回复后清除
+  const [thinking, setThinking] = useState(false)
+  // 每秒刷新一次，让 Agent 活跃状态随时间自动回落
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  // 每个 Agent 最近一次发出事件的时间（10 秒内视为活跃）
+  const lastActive: Record<string, number> = {}
+  for (const e of events) {
+    const t = new Date(e.timestamp).getTime()
+    if (t > (lastActive[e.source] ?? 0)) lastActive[e.source] = t
+  }
+  const isActive = (source: string) => now - (lastActive[source] ?? 0) < 10000
+
+  // 收到 Tutor/Hint 的回复事件即视为"思考结束"
+  useEffect(() => {
+    const last = events[events.length - 1]
+    if (last && (last.source === 'TutorAgent' || last.source === 'HintAgent')) {
+      setThinking(false)
+    }
+  }, [events])
 
   const handleSubmit = (isCorrect: boolean) => {
     send({
@@ -61,8 +127,11 @@ export default function App() {
 
   const handleQuestion = () => {
     if (!message.trim()) return
+    setThinking(true)
     send({ action: 'question', knowledge_id: knowledgeId, question: message })
     setMessage('')
+    // 兜底：LLM 异常超时 60s 后自动清除指示（期间可能触发降级模板）
+    setTimeout(() => setThinking(false), 60000)
   }
 
   return (
@@ -72,6 +141,12 @@ export default function App() {
       padding: 24,
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     }}>
+      <style>{`
+        @keyframes thinkingPulse {
+          0%, 100% { opacity: 0.3; transform: scale(0.8); }
+          50% { opacity: 1; transform: scale(1.2); }
+        }
+      `}</style>
       <header style={{ marginBottom: 24 }}>
         <h1 style={{ margin: 0 }}>多Agent智能教育系统</h1>
         <p style={{ color: '#666' }}>
@@ -163,12 +238,33 @@ export default function App() {
             background: '#f8fafc', border: '1px solid #e2e8f0',
           }}>
             <h3 style={{ margin: '0 0 8px' }}>Agent 状态</h3>
-            {Object.entries(AGENT_COLORS).filter(([k]) => k !== 'api').map(([name, color]) => (
-              <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                <div style={{ width: 12, height: 12, borderRadius: '50%', background: color }} />
-                <span style={{ fontSize: 14 }}>{name}</span>
-              </div>
-            ))}
+            {Object.entries(AGENT_COLORS).filter(([k]) => k !== 'api').map(([name, color]) => {
+              const active = isActive(name)
+              return (
+                <div key={name} style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  marginBottom: 8, opacity: active ? 1 : 0.55,
+                  padding: '4px 8px', borderRadius: 6,
+                  background: active ? `${color}15` : 'transparent',
+                  transition: 'all 0.4s',
+                }}>
+                  <div style={{
+                    width: 12, height: 12, borderRadius: '50%',
+                    background: active ? color : '#cbd5e1',
+                    boxShadow: active ? `0 0 8px ${color}` : 'none',
+                    transition: 'all 0.4s',
+                  }} />
+                  <span style={{ fontSize: 13 }}>{AGENT_LABELS[name] || name}</span>
+                  <span style={{
+                    fontSize: 12, marginLeft: 'auto',
+                    color: active ? '#10b981' : '#94a3b8',
+                    fontWeight: active ? 600 : 400,
+                  }}>
+                    {active ? '活跃' : '待命'}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         </div>
 
@@ -176,7 +272,8 @@ export default function App() {
         <div>
           <h2>Agent 事件流 ({events.length})</h2>
           <div style={{
-            maxHeight: 600,
+            maxHeight: 'calc(100vh - 200px)',
+            minHeight: 400,
             overflowY: 'auto',
             border: '1px solid #e2e8f0',
             borderRadius: 8,
