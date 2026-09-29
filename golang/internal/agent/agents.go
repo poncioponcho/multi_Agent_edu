@@ -110,6 +110,24 @@ func NewTutorAgent(bus *eventbus.EventBus, opts ...TutorOption) *TutorAgent {
 func (t *TutorAgent) Start() {
 	t.bus.Subscribe(eventbus.AssessmentComplete, t.handleAssessment)
 	t.bus.Subscribe(eventbus.EngagementAlert, t.handleEngagement)
+	t.bus.Subscribe(eventbus.StudentQuestion, t.handleQuestion)
+}
+
+// handleQuestion 响应学生自由提问（POST /api/v1/question 入口）
+func (t *TutorAgent) handleQuestion(event eventbus.Event) {
+	knowledgeID, _ := event.Data["knowledge_id"].(string)
+	question, _ := event.Data["question"].(string)
+
+	response := t.answerQuestion(knowledgeID, question)
+
+	t.bus.PublishChild(event, eventbus.Event{
+		Type: eventbus.TeachingResponse, Source: "TutorAgent",
+		LearnerID: event.LearnerID,
+		Data: map[string]interface{}{
+			"knowledge_id": knowledgeID, "response": response,
+			"teaching_style": "socratic",
+		},
+	})
 }
 
 func (t *TutorAgent) handleAssessment(event eventbus.Event) {
@@ -203,6 +221,45 @@ func (t *TutorAgent) knowledgeName(knowledgeID string) (string, bool) {
 		return knowledgeID, false
 	}
 	return n.Name, true
+}
+
+// answerQuestion 生成对自由提问的苏格拉底式回复：
+//  1. RAG：按知识点名称检索教材片段，注入引用（citation）
+//  2. LLM：有 Key 时基于检索片段生成引导式回复（低温度，稳定）
+//  3. 降级：LLM 不可用/失败时使用模板回复，保证服务可用
+func (t *TutorAgent) answerQuestion(knowledgeID, question string) string {
+	name := knowledgeID
+	if n, ok := t.knowledgeName(knowledgeID); ok {
+		name = n
+	}
+
+	citation := ""
+	if t.retriever != nil {
+		hits := t.retriever.Search(name, 1)
+		if len(hits) > 0 && hits[0].Score > 0 {
+			citation = fmt.Sprintf("（📖 参考教材《%s》：%s…）",
+				hits[0].Doc.Title, snippet(hits[0].Doc.Content, 55))
+		}
+	}
+
+	if t.llm != nil {
+		system := "你是苏格拉底式教学助教。规则：绝不直接给出答案，只能通过提问引导学生自己思考。" +
+			"回复必须简短（不超过2句话），且以提问结尾。"
+		user := fmt.Sprintf("学生正在学习「%s」，提问：%s。%s请给出你的引导式回复。",
+			name, question, citation)
+		resp, err := t.llm.Chat([]llm.Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		}, 0.4)
+		if err == nil {
+			return resp
+		}
+		log.Printf("[Tutor] LLM failed, fallback to template: %v", err)
+	}
+
+	return fmt.Sprintf(
+		"好的，关于「%s」，你的问题是：%s\n在我回答之前，让我先问你：\n你对这个知识点已经了解了哪些内容？试着说说你的理解，我们一起看看对不对。%s",
+		name, question, citation)
 }
 
 func (t *TutorAgent) handleEngagement(event eventbus.Event) {
