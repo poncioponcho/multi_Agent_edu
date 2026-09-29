@@ -30,8 +30,16 @@ class LLMClient:
             "",
             "your-openai-api-key-here",
         ):
-            self._client = AsyncOpenAI(api_key=settings.openai_api_key)
-            logger.info("LLMClient initialized with model=%s", settings.openai_model)
+            # 支持自定义 base_url（DeepSeek 等 OpenAI 兼容端点），未配置时走 OpenAI 官方
+            self._client = AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url or None,
+            )
+            logger.info(
+                "LLMClient initialized with model=%s, base_url=%s",
+                settings.openai_model,
+                settings.openai_base_url or "https://api.openai.com/v1",
+            )
         else:
             logger.warning("LLMClient: no valid API key, will use template fallback")
 
@@ -54,6 +62,12 @@ class LLMClient:
         if not self._client:
             return ""
 
+        # 推理模型（DeepSeek v4 等）思考 token 计入输出预算且不可控，
+        # 通过 extra_body 禁用/限制思考；不支持该参数的 provider 留空即可
+        extra: dict = {}
+        if settings.llm_reasoning_effort:
+            extra["extra_body"] = {"reasoning_effort": settings.llm_reasoning_effort}
+
         try:
             response = await self._client.chat.completions.create(
                 model=settings.openai_model,
@@ -62,7 +76,10 @@ class LLMClient:
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=512,
+                # 推理模型的思考 token 也计入输出预算，512 会被推理耗尽导致
+                # content 为空（静默降级模板），故放宽
+                max_tokens=2048,
+                **extra,
             )
             content = response.choices[0].message.content or ""
             logger.info("[LLM] tokens=%s", response.usage.total_tokens if response.usage else "?")
@@ -111,6 +128,13 @@ class LLMClient:
         ),
     }
 
+    # 输出格式约束：前端无 LaTeX 渲染时保证公式可读性
+    MATH_FORMAT_RULE = (
+        "\n\n输出格式要求：数学表达式一律使用纯文本写法，"
+        "例如 2x+3=7、x = (-b ± √(b²-4ac)) / (2a)、y ≥ 3。"
+        "禁止使用 LaTeX 标记（如 \\( \\) \\[ \\] $ \\frac \\sqrt 等）。"
+    )
+
     async def socratic_teach(
         self,
         level: Literal["beginner", "developing", "proficient", "mastered"],
@@ -118,7 +142,7 @@ class LLMClient:
     ) -> str:
         """苏格拉底式教学：根据学生水平选择 System Prompt。"""
         system = self.SOCRATIC_SYSTEM_PROMPTS.get(level, self.SOCRATIC_SYSTEM_PROMPTS["beginner"])
-        return await self.chat(system, context, temperature=0.7)
+        return await self.chat(system + self.MATH_FORMAT_RULE, context, temperature=0.7)
 
     async def generate_hint(
         self,
@@ -127,4 +151,4 @@ class LLMClient:
     ) -> str:
         """分级提示生成。"""
         system = self.HINT_SYSTEM_PROMPTS.get(level, self.HINT_SYSTEM_PROMPTS["metacognitive"])
-        return await self.chat(system, context, temperature=0.6)
+        return await self.chat(system + self.MATH_FORMAT_RULE, context, temperature=0.6)
