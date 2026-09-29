@@ -19,24 +19,39 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
-    """WebSocket连接管理器。"""
+    """WebSocket连接管理器。
+
+    支持同一 learner_id 多个并发连接（如多开标签页/投屏）：
+    事件会广播到该学习者的所有连接，而非后连顶替前连。
+    """
 
     def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
+        self.active_connections: dict[str, list[WebSocket]] = {}
 
     async def connect(self, learner_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[learner_id] = websocket
-        logger.info("WebSocket connected: %s", learner_id)
+        self.active_connections.setdefault(learner_id, []).append(websocket)
+        logger.info(
+            "WebSocket connected: %s (%d active)", learner_id,
+            len(self.active_connections[learner_id]),
+        )
 
-    def disconnect(self, learner_id: str):
-        self.active_connections.pop(learner_id, None)
+    def disconnect(self, learner_id: str, websocket: WebSocket):
+        conns = self.active_connections.get(learner_id)
+        if conns and websocket in conns:
+            conns.remove(websocket)
+            if not conns:
+                self.active_connections.pop(learner_id, None)
         logger.info("WebSocket disconnected: %s", learner_id)
 
     async def send_to_learner(self, learner_id: str, data: dict):
-        ws = self.active_connections.get(learner_id)
-        if ws:
-            await ws.send_json(data)
+        # 广播到该学习者的所有连接；向已断开的连接发送会抛异常，跳过并清理
+        for ws in list(self.active_connections.get(learner_id, [])):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                logger.warning("Send to stale connection failed, removing (learner=%s)", learner_id)
+                self.disconnect(learner_id, ws)
 
 
 manager = ConnectionManager()
@@ -88,7 +103,7 @@ async def websocket_endpoint(websocket: WebSocket, learner_id: str):
                 )
 
     except WebSocketDisconnect:
-        manager.disconnect(learner_id)
+        manager.disconnect(learner_id, websocket)
     except Exception:
         logger.exception("WebSocket error for learner %s", learner_id)
-        manager.disconnect(learner_id)
+        manager.disconnect(learner_id, websocket)
