@@ -31,8 +31,6 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("Agent orchestrator started with 5 agents (db=%s)", db_manager.is_available)
     yield
     logging.getLogger(__name__).info("Shutting down")
-from api.websocket import ws_router
-from api.orchestrator import AgentOrchestrator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,16 +39,6 @@ logging.basicConfig(
 )
 
 orchestrator: AgentOrchestrator | None = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global orchestrator
-    orchestrator = AgentOrchestrator()
-    app.state.orchestrator = orchestrator
-    logging.getLogger(__name__).info("Agent orchestrator started with 5 agents")
-    yield
-    logging.getLogger(__name__).info("Shutting down")
 
 
 app = FastAPI(

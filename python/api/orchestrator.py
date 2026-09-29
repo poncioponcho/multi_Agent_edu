@@ -54,48 +54,6 @@ class AgentOrchestrator:
             event_bus=self.event_bus,
             learner_models=self.learner_models,
         )
-from core.learner_model import LearnerModel
-from agents import (
-    AssessmentAgent,
-    TutorAgent,
-    CurriculumAgent,
-    HintAgent,
-    EngagementAgent,
-)
-
-
-class AgentOrchestrator:
-    """Agent编排器：管理所有Agent和共享状态。"""
-
-    def __init__(self) -> None:
-        self.event_bus = EventBus()
-        self.learner_models: dict[str, LearnerModel] = {}
-
-        self.assessment = AssessmentAgent(
-            name="AssessmentAgent",
-            event_bus=self.event_bus,
-            learner_models=self.learner_models,
-        )
-        self.tutor = TutorAgent(
-            name="TutorAgent",
-            event_bus=self.event_bus,
-            learner_models=self.learner_models,
-        )
-        self.curriculum = CurriculumAgent(
-            name="CurriculumAgent",
-            event_bus=self.event_bus,
-            learner_models=self.learner_models,
-        )
-        self.hint = HintAgent(
-            name="HintAgent",
-            event_bus=self.event_bus,
-            learner_models=self.learner_models,
-        )
-        self.engagement = EngagementAgent(
-            name="EngagementAgent",
-            event_bus=self.event_bus,
-            learner_models=self.learner_models,
-        )
 
     async def submit_answer(
         self, learner_id: str, knowledge_id: str, is_correct: bool, time_spent: float = 0
