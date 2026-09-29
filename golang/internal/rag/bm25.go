@@ -30,12 +30,12 @@ type ScoredDoc struct {
 
 // BM25 检索器 -- Okapi BM25 实现
 type BM25 struct {
-	corpus     []Document
-	docLens    []int
-	avgDocLen  float64
-	docFreq    map[string]int // token -> 包含该token的文档数
-	totalDocs  int
-	k1, b      float64
+	corpus    []Document
+	docLens   []int
+	avgDocLen float64
+	docFreq   map[string]int // token -> 包含该token的文档数
+	totalDocs int
+	k1, b     float64
 }
 
 // NewBM25 构建BM25索引

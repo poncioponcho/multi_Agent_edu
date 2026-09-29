@@ -129,10 +129,10 @@ type Report struct {
 
 // CaseDetail 单个用例明细
 type CaseDetail struct {
-	Name   string    `json:"name"`
-	Passed bool      `json:"passed"`
+	Name   string     `json:"name"`
+	Passed bool       `json:"passed"`
 	Rounds []RoundObs `json:"rounds"`
-	Reason string    `json:"reason,omitempty"`
+	Reason string     `json:"reason,omitempty"`
 }
 
 // DialogDetail 对话场景明细

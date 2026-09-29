@@ -71,7 +71,7 @@ func TestToolsList(t *testing.T) {
 func TestCallQueryKnowledgeGraph(t *testing.T) {
 	s := newTestServer()
 	out := call(t, s, "tools/call", 3, map[string]interface{}{
-		"name": "query_knowledge_graph",
+		"name":      "query_knowledge_graph",
 		"arguments": map[string]interface{}{"id": "quadratic_eq"},
 	})
 	result := out["result"].(map[string]interface{})

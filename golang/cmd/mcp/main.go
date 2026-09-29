@@ -1,7 +1,8 @@
 // MCP Server：以 stdio 协议暴露知识图谱查询、数学计算、教材检索能力。
 //
 // 用法：
-//   go run cmd/mcp/main.go            # 启动 stdio 模式的 MCP Server
+//
+//	go run cmd/mcp/main.go            # 启动 stdio 模式的 MCP Server
 //
 // 支持 MCP 方法：initialize / tools/list / tools/call
 // 支持工具：query_knowledge_graph / calculate / retrieve_textbook

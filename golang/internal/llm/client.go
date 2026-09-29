@@ -25,10 +25,10 @@ type Message struct {
 
 // Client LLM客户端
 type Client struct {
-	apiKey    string
-	baseURL   string
-	model     string
-	http      *http.Client
+	apiKey  string
+	baseURL string
+	model   string
+	http    *http.Client
 }
 
 // NewClientFromEnv 从环境变量创建客户端：

@@ -1,7 +1,8 @@
 // Eval CLI：运行 Agent 评测并输出结构化报告
 //
 // 用法：
-//   go run cmd/eval/main.go            # 输出完整评测报告（JSON + 摘要）
+//
+//	go run cmd/eval/main.go            # 输出完整评测报告（JSON + 摘要）
 package main
 
 import (

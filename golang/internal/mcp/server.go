@@ -139,7 +139,7 @@ func NewServer(kg []model.KnowledgeNode, retriever *rag.BM25) *Server {
 			for _, h := range hits {
 				out = append(out, map[string]interface{}{
 					"knowledge_id": h.Doc.ID, "title": h.Doc.Title,
-					"score":  round(h.Score, 4),
+					"score":   round(h.Score, 4),
 					"excerpt": snippet(h.Doc.Content, 120),
 				})
 			}

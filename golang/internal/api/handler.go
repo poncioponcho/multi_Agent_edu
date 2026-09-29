@@ -22,10 +22,10 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retr
 
 	mux.HandleFunc("POST /api/v1/submit", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			LearnerID  string  `json:"learner_id"`
-			KnowledgeID string `json:"knowledge_id"`
-			IsCorrect  bool   `json:"is_correct"`
-			TimeSpent  float64 `json:"time_spent_seconds"`
+			LearnerID   string  `json:"learner_id"`
+			KnowledgeID string  `json:"knowledge_id"`
+			IsCorrect   bool    `json:"is_correct"`
+			TimeSpent   float64 `json:"time_spent_seconds"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -36,8 +36,8 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retr
 			Type: eventbus.StudentSubmission, Source: "api",
 			LearnerID: body.LearnerID,
 			Data: map[string]interface{}{
-				"knowledge_id":      body.KnowledgeID,
-				"is_correct":        body.IsCorrect,
+				"knowledge_id":       body.KnowledgeID,
+				"is_correct":         body.IsCorrect,
 				"time_spent_seconds": body.TimeSpent,
 			},
 		})
