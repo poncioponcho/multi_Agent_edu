@@ -39,6 +39,13 @@ func (a *AssessmentAgent) GetModel(learnerID string) *model.LearnerModel {
 	return m
 }
 
+// LearnerCount 返回当前已建模型的学习者数量（并发安全，供 /debug/stats 使用）
+func (a *AssessmentAgent) LearnerCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return len(a.Models)
+}
+
 func (a *AssessmentAgent) handleSubmission(event eventbus.Event) {
 	knowledgeID, _ := event.Data["knowledge_id"].(string)
 	isCorrect, _ := event.Data["is_correct"].(bool)
@@ -451,9 +458,11 @@ func (e *EngagementAgent) trackSubmission(event eventbus.Event) {
 }
 
 func (e *EngagementAgent) analyze(event eventbus.Event) {
-	eng := e.getEngagement(event.LearnerID)
+	// 用快照而非实时指针：trackSubmission 会在其他 goroutine 里并发改写
+	// 同一 learnerEngagement，直接在原结构上读会构成数据竞争（-race 可复现）。
+	snap := e.snapshotEngagement(event.LearnerID)
 
-	if eng.consecutiveErrors >= 3 {
+	if snap.consecutiveErrors >= 3 {
 		e.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.EngagementAlert, Source: "EngagementAgent",
 			LearnerID: event.LearnerID,
@@ -462,32 +471,62 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 				"message":    "别灰心！犯错是学习的一部分。",
 			},
 		})
-	} else if eng.consecutiveCorrect >= 5 {
-		correct := 0
-		for _, r := range eng.recentResults {
-			if r {
-				correct++
+	} else if snap.consecutiveCorrect >= 5 {
+		if snap.recentTotal > 0 {
+			accuracy := float64(snap.recentCorrect) / float64(snap.recentTotal)
+			if accuracy > 0.9 {
+				e.bus.PublishChild(event, eventbus.Event{
+					Type: eventbus.EngagementAlert, Source: "EngagementAgent",
+					LearnerID: event.LearnerID,
+					Data: map[string]interface{}{
+						"alert_type": "boredom",
+						"message":    "你表现非常棒！让我们挑战更难的内容！",
+					},
+				})
 			}
 		}
-		accuracy := float64(correct) / float64(len(eng.recentResults))
-		if accuracy > 0.9 {
-			e.bus.PublishChild(event, eventbus.Event{
-				Type: eventbus.EngagementAlert, Source: "EngagementAgent",
-				LearnerID: event.LearnerID,
-				Data: map[string]interface{}{
-					"alert_type": "boredom",
-					"message":    "你表现非常棒！让我们挑战更难的内容！",
-				},
-			})
-		}
-	} else if eng.consecutiveCorrect >= 3 {
+	} else if snap.consecutiveCorrect >= 3 {
 		e.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.Encouragement, Source: "EngagementAgent",
 			LearnerID: event.LearnerID,
 			Data: map[string]interface{}{
-				"message": fmt.Sprintf("连续%d题全对！继续保持！", eng.consecutiveCorrect),
+				"message": fmt.Sprintf("连续%d题全对！继续保持！", snap.consecutiveCorrect),
 			},
 		})
+	}
+}
+
+// engagementSnapshot 是 learnerEngagement 在某一时刻的一致快照。
+type engagementSnapshot struct {
+	consecutiveErrors  int
+	consecutiveCorrect int
+	recentCorrect      int
+	recentTotal        int
+}
+
+// snapshotEngagement 在锁内一次性取出判定所需的全部字段，
+// 使 analyze 的判断基于一致视图，而不是逐个字段读被并发修改的结构。
+func (e *EngagementAgent) snapshotEngagement(learnerID string) engagementSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	eng, ok := e.engagements[learnerID]
+	if !ok {
+		eng = &learnerEngagement{}
+		e.engagements[learnerID] = eng
+	}
+
+	correct := 0
+	for _, r := range eng.recentResults {
+		if r {
+			correct++
+		}
+	}
+	return engagementSnapshot{
+		consecutiveErrors:  eng.consecutiveErrors,
+		consecutiveCorrect: eng.consecutiveCorrect,
+		recentCorrect:      correct,
+		recentTotal:        len(eng.recentResults),
 	}
 }
 

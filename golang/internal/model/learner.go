@@ -56,10 +56,11 @@ func NewLearnerModel(learnerID string) *LearnerModel {
 	}
 }
 
-// GetState 获取知识点状态
-func (m *LearnerModel) GetState(knowledgeID string) *KnowledgeState {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// getStateLocked 返回知识点状态指针（不存在则创建）。
+//
+// 调用方必须已持有 m.mu 写锁。之所以需要这个内部版本：sync.RWMutex 不可重入，
+// UpdateMastery 已持写锁时若再调用 GetState（其内部要取锁）会自死锁。
+func (m *LearnerModel) getStateLocked(knowledgeID string) *KnowledgeState {
 	s, ok := m.states[knowledgeID]
 	if !ok {
 		s = &KnowledgeState{KnowledgeID: knowledgeID, Mastery: pInit}
@@ -68,9 +69,43 @@ func (m *LearnerModel) GetState(knowledgeID string) *KnowledgeState {
 	return s
 }
 
+// GetState 获取知识点状态的**快照副本**（不存在则先创建）。
+//
+// 返回副本而非内部指针：内部指针会在调用方读取期间被 UpdateMastery 并发写入，
+// 把指针交出去等于把数据竞争暴露给调用方（handler 层就曾因此触发 -race）。
+func (m *LearnerModel) GetState(knowledgeID string) KnowledgeState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return *m.getStateLocked(knowledgeID)
+}
+
+// Mastery 只读地查询某知识点的掌握度。
+//
+// 与 GetState 的两点区别：① 只持读锁；② 不创建不存在的条目。
+// API 层的只读接口（如 /next-topics）应使用它——用 GetState 会导致每个
+// GET 请求都为全部知识点创建条目并反复取写锁，属于读接口写放大。
+func (m *LearnerModel) Mastery(knowledgeID string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.states[knowledgeID]; ok {
+		return s.Mastery
+	}
+	return pInit
+}
+
 // UpdateMastery BKT核心算法
-func (m *LearnerModel) UpdateMastery(knowledgeID string, isCorrect bool) *KnowledgeState {
-	state := m.GetState(knowledgeID)
+//
+// 并发安全：整个「读 Mastery → 贝叶斯更新 → 写回 Mastery/Attempts/Streak/...」
+// 必须在同一把写锁内完成，并且返回值是快照副本。
+//
+// 修复前该 RMW 在锁外执行（GetState 只在取指针时持锁），同一 learner 的
+// 并发提交会读到同一个旧 Mastery 并互相覆盖——经典的 lost update，静默丢数据。
+// 回归测试见 learner_concurrency_test.go::TestUpdateMasteryConcurrentLostUpdate。
+func (m *LearnerModel) UpdateMastery(knowledgeID string, isCorrect bool) KnowledgeState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state := m.getStateLocked(knowledgeID)
 	pL := state.Mastery
 
 	var pObsGivenL, pObsGivenNotL float64
@@ -95,17 +130,17 @@ func (m *LearnerModel) UpdateMastery(knowledgeID string, isCorrect bool) *Knowle
 	state.Mastery = math.Max(0, math.Min(1, pLNew))
 	state.Attempts++
 	state.LastAttempt = time.Now()
-	return state
+	return *state
 }
 
-// GetWeakPoints 获取薄弱知识点
-func (m *LearnerModel) GetWeakPoints(threshold float64) []*KnowledgeState {
+// GetWeakPoints 获取薄弱知识点（返回快照副本，不暴露内部指针）
+func (m *LearnerModel) GetWeakPoints(threshold float64) []KnowledgeState {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var weak []*KnowledgeState
+	var weak []KnowledgeState
 	for _, s := range m.states {
 		if s.Mastery < threshold && s.Attempts > 0 {
-			weak = append(weak, s)
+			weak = append(weak, *s)
 		}
 	}
 	return weak
