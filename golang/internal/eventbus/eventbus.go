@@ -154,6 +154,36 @@ func (b *EventBus) DroppedCount() int64 {
 	return b.dropped
 }
 
+// HistoryLen 返回事件历史长度。
+//
+// 注意：history 目前只追加、从不淘汰，因此该值等于进程生命周期内
+// 处理过的全部事件数。压测用它观测内存增长（见 docs/压测报告.md）。
+func (b *EventBus) HistoryLen() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.history)
+}
+
+// SeenLen 返回去重表当前条目数。
+//
+// 去重表仅在超过 MaxSeenEntries(5000) 时清理一次，且只删除 5 分钟前的记录，
+// 高吞吐下该表会持续增长；压测用它观测去重表的膨胀与清理开销。
+func (b *EventBus) SeenLen() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.seen)
+}
+
+// QueueLen 返回事件通道当前积压长度，用于观测消费是否跟得上生产。
+func (b *EventBus) QueueLen() int {
+	return len(b.eventChan)
+}
+
+// QueueCap 返回事件通道容量。
+func (b *EventBus) QueueCap() int {
+	return cap(b.eventChan)
+}
+
 // dispatch 事件分发goroutine
 func (b *EventBus) dispatch() {
 	for event := range b.eventChan {

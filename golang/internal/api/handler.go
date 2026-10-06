@@ -3,12 +3,17 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"runtime"
+	"time"
 
 	"github.com/multi-agent-education/golang/internal/agent"
 	"github.com/multi-agent-education/golang/internal/eventbus"
 	"github.com/multi-agent-education/golang/internal/model"
 	"github.com/multi-agent-education/golang/internal/rag"
 )
+
+// startedAt 进程启动时间，用于 /debug/stats 计算运行时长
+var startedAt = time.Now()
 
 // SetupRouter 配置HTTP路由
 func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retriever *rag.BM25) http.Handler {
@@ -102,10 +107,37 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retr
 		m := assessment.GetModel(learnerID)
 		mastery := make(map[string]float64)
 		for _, id := range knowledgeIDs() {
-			mastery[id] = m.GetState(id).Mastery
+			// 用只读的 Mastery()：不创建条目、只持读锁。
+			// 早期版本用 GetState()，会让每个 GET 请求为全部知识点
+			// 创建条目并反复取写锁（读接口写放大）。
+			mastery[id] = m.Mastery(id)
 		}
 		next := model.RecommendNext(mastery)
 		writeJSON(w, map[string]interface{}{"learner_id": learnerID, "next_topics": next})
+	})
+
+	// 运行时指标：供压测/容量规划采样（goroutine、内存、事件总线积压）
+	mux.HandleFunc("GET /api/v1/debug/stats", func(w http.ResponseWriter, r *http.Request) {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+
+		writeJSON(w, map[string]interface{}{
+			"uptime_seconds":    time.Since(startedAt).Seconds(),
+			"goroutines":        runtime.NumGoroutine(),
+			"num_cpu":           runtime.NumCPU(),
+			"heap_alloc_bytes":  ms.HeapAlloc,
+			"heap_inuse_bytes":  ms.HeapInuse,
+			"gc_count":          ms.NumGC,
+			"gc_pause_total_ns": ms.PauseTotalNs,
+			"learners":          assessment.LearnerCount(),
+			"eventbus": map[string]interface{}{
+				"history_len": bus.HistoryLen(),
+				"seen_len":    bus.SeenLen(),
+				"queue_len":   bus.QueueLen(),
+				"queue_cap":   bus.QueueCap(),
+				"dropped":     bus.DroppedCount(),
+			},
+		})
 	})
 
 	return withCORS(mux)

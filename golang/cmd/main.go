@@ -1,8 +1,10 @@
 package main
 
 import (
+	"io"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/multi-agent-education/golang/internal/agent"
 	"github.com/multi-agent-education/golang/internal/api"
@@ -16,6 +18,15 @@ import (
 // Go版使用 goroutine + channel 实现事件驱动，
 // 天然适合高并发Agent并行处理。
 func main() {
+	// EDU_QUIET=1 关闭日志输出。
+	//
+	// EventBus 在 Publish 与 dispatch 各打一条 log.Printf，属于同步写 stderr，
+	// 是单请求路径上最重的开销之一。压测时必须静音，否则测到的是日志 I/O
+	// 而不是总线本身（见 docs/压测报告.md）。
+	if os.Getenv("EDU_QUIET") == "1" {
+		log.SetOutput(io.Discard)
+	}
+
 	bus := eventbus.New()
 
 	// 初始化RAG检索器与LLM客户端（无API Key时LLM为nil，Tutor自动降级模板回复）
