@@ -88,14 +88,29 @@ class LearnerModel:
         self.total_interactions: int = 0
         self.metadata: dict[str, Any] = {}
 
-    def get_state(self, knowledge_id: str) -> KnowledgeState:
-        """获取某知识点的状态，不存在则创建。"""
+    def _get_state_live(self, knowledge_id: str) -> KnowledgeState:
+        """返回内部存储的**实时对象**，不存在则创建。
+
+        ⚠️ 仅供本类内部使用。外部调用方若持有它并跨 `await` 读取，期间其他协程
+        对同一知识点的更新会就地改写它，读到的是「别人的状态」。外部一律走
+        `get_state()` 拿快照。
+        """
         if knowledge_id not in self.knowledge_states:
             self.knowledge_states[knowledge_id] = KnowledgeState(
                 knowledge_id=knowledge_id,
                 mastery=self.bkt.p_init,
             )
         return self.knowledge_states[knowledge_id]
+
+    def get_state(self, knowledge_id: str) -> KnowledgeState:
+        """获取某知识点状态的**快照**，不存在则先创建。
+
+        为什么返回快照而不是内部对象：Agent 处理一次提交时会跨多个 `await`
+        读取这些字段，而 asyncio 的协作式调度会在 `await` 处切走协程。若返回
+        内部对象，后一次提交的更新会就地改写它，导致前一次提交发出的事件携带
+        后一次的结果。回归测试见 `tests/test_concurrency.py`。
+        """
+        return self._get_state_live(knowledge_id).model_copy()
 
     def update_mastery(self, knowledge_id: str, is_correct: bool) -> KnowledgeState:
         """
@@ -117,7 +132,7 @@ class LearnerModel:
           学习转移（每次练习都可能学会）：
             P(Lₙ) = P(Lₙ|obs) + (1 - P(Lₙ|obs)) × P(T)
         """
-        state = self.get_state(knowledge_id)
+        state = self._get_state_live(knowledge_id)
         p_l = state.mastery
 
         if is_correct:
@@ -153,19 +168,22 @@ class LearnerModel:
             state.mastery,
             state.level.value,
         )
-        return state
+        # 返回快照：调用方会跨 await 读它，返回内部对象会读到后续更新的结果
+        return state.model_copy()
 
     def get_weak_points(self, threshold: float = 0.4, limit: int = 10) -> list[KnowledgeState]:
-        """获取薄弱知识点（mastery低于阈值且已尝试过）。"""
+        """获取薄弱知识点（mastery低于阈值且已尝试过），返回快照列表。"""
         weak = [
-            s for s in self.knowledge_states.values()
+            s.model_copy() for s in self.knowledge_states.values()
             if s.mastery < threshold and s.attempts > 0
         ]
         return sorted(weak, key=lambda s: s.mastery)[:limit]
 
     def get_strong_points(self, threshold: float = 0.85) -> list[KnowledgeState]:
-        """获取已掌握的知识点。"""
-        return [s for s in self.knowledge_states.values() if s.mastery >= threshold]
+        """获取已掌握的知识点，返回快照列表。"""
+        return [
+            s.model_copy() for s in self.knowledge_states.values() if s.mastery >= threshold
+        ]
 
     def get_overall_progress(self) -> dict[str, Any]:
         """获取整体学习进度统计。"""
