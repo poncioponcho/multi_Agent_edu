@@ -1,9 +1,32 @@
 """REST API 路由。"""
 
+import asyncio
+import os
+import sys
+import time
+
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 router = APIRouter(tags=["education"])
+
+# 进程启动时间，用于 /debug/stats 计算运行时长
+_STARTED_AT = time.monotonic()
+
+
+def _peak_rss_bytes() -> int:
+    """进程峰值常驻内存。
+
+    Go 版对应字段是堆分配量；Python 侧取 ru_maxrss（峰值 RSS）作为近似。
+    注意单位差异：macOS 返回字节，Linux 返回 KB。
+    """
+    try:
+        import resource
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(rss if sys.platform == "darwin" else rss * 1024)
+    except Exception:  # pragma: no cover - 取不到指标不应影响接口
+        return 0
 
 
 class SubmitAnswerRequest(BaseModel):
@@ -101,4 +124,37 @@ async def get_knowledge_graph(request: Request):
             for n in graph.nodes.values()
         ],
         "learning_order": graph.topological_sort(),
+    }
+
+
+@router.get("/debug/stats")
+async def debug_stats(request: Request):
+    """运行时指标 —— 供压测采样。
+
+    字段名与 Go 版 `/api/v1/debug/stats` 对齐，使同一个压测器可以同时压两边。
+    Python 侧没有 goroutine / GC 计数，对应字段置 0 而非省略，避免压测器解析失败。
+    """
+    from api.websocket import manager
+
+    orch = getattr(request.app.state, "orchestrator", None)
+
+    ws_connections = sum(len(v) for v in manager.active_connections.values())
+
+    return {
+        "uptime_seconds": round(time.monotonic() - _STARTED_AT, 3),
+        "goroutines": 0,  # Python 侧无 goroutine 概念
+        "asyncio_tasks": len(asyncio.all_tasks()),
+        "num_cpu": os.cpu_count() or 0,
+        "heap_alloc_bytes": _peak_rss_bytes(),  # 语义为峰值 RSS，见 _peak_rss_bytes
+        "gc_count": 0,
+        "learners": len(orch.learner_models) if orch else 0,
+        "ws_connections": ws_connections,
+        "ws_learners": len(manager.active_connections),
+        "eventbus": {
+            "history_len": len(orch.event_bus._event_history) if orch else 0,
+            "seen_len": 0,
+            "queue_len": 0,
+            "queue_cap": 0,
+            "dropped": 0,
+        },
     }

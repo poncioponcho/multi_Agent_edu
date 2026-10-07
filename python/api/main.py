@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes import router
 from api.websocket import ws_router
 from api.orchestrator import AgentOrchestrator
+from config.settings import settings
 from core.database import db_manager
 
 
@@ -33,7 +34,10 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("Shutting down")
 
 logging.basicConfig(
-    level=logging.INFO,
+    # 原实现硬编码 INFO，导致 settings.log_level / .env 里的 LOG_LEVEL 完全不生效。
+    # 压测必须能静音：EventBus 每次 publish 都 logger.info，同步写 stdout 会成为
+    # 单请求路径上最重的开销之一（与 Go 版的 EDU_QUIET 同源问题）。
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     stream=sys.stdout,
 )
