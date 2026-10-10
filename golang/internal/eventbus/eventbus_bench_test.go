@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -41,9 +42,13 @@ func benchEvent(i int) Event {
 
 // BenchmarkPublish 无订阅者的顺序发布：测量纯入队成本（含去重表写入）。
 //
-// 注意：b.N 次发布会让去重表增长到 b.N 条。当 b.N > MaxSeenEntries(5000) 时
-// cleanSeenLocked 会在**每次**发布时全表遍历一次，因此用不同 -benchtime
-// 跑这个基准，ns/op 会在 5000 附近出现台阶式跃升——这就是吞吐悬崖。
+// 历史背景：改造前 b.N 次发布会让去重表增长到 b.N 条，一旦超过
+// MaxSeenEntries(5000)，cleanSeenLocked 就会在**每次**发布时全表遍历一次，
+// 于是用不同 -benchtime 跑这个基准，ns/op 会在 5000 处出现台阶式跃升
+// （5000→50000 事件，吞吐降 163 倍）。
+//
+// 现在去重表是固定容量环形索引，判重与淘汰均为 O(1)、无清理步骤，
+// ns/op 应随 b.N 保持平稳——本基准因此同时是「悬崖不复发」的哨兵。
 func BenchmarkPublish(b *testing.B) {
 	bus := New()
 	b.ReportAllocs()
@@ -112,9 +117,11 @@ func BenchmarkGetTrace(b *testing.B) {
 	for _, n := range []int{1000, 5000, 20000} {
 		b.Run(fmt.Sprintf("history=%d", n), func(b *testing.B) {
 			bus := prefillHistory(n)
-			// 取一条真实存在的 correlation id，让扫描走到最后才命中
+			// 取一条真实存在的 correlation id，让扫描走到最后才命中。
+			// 注意 history 已是环形缓冲：最旧的有效元素在 histStart 处，
+			// 未满时 histStart 恒为 0，满时指向真正的起点。
 			bus.mu.RLock()
-			target := bus.history[0].CorrelationID
+			target := bus.history[bus.histStart].CorrelationID
 			bus.mu.RUnlock()
 
 			b.ReportAllocs()
@@ -126,22 +133,30 @@ func BenchmarkGetTrace(b *testing.B) {
 	}
 }
 
-// BenchmarkPublishSeenTableCost 隔离去重表的清理开销。
+// BenchmarkPublishSeenTableCost 隔离去重表规模对发布成本的影响。
 //
-// prefilled 表示发布前去重表里已有多少条记录：
-//   - 1000  → 低于 MaxSeenEntries，Publish 不做清理
-//   - 20000 → 超过阈值，**每次** Publish 都全表遍历一次找过期项
+// prefilled 表示发布前去重表里已有多少条记录，覆盖三种形态：
+//   - 1000  → 远未达上限，纯 map 写入
+//   - 20000 → 未达上限（默认 50000）
+//   - 60000 → 已超上限，每次写入都触发一次环形淘汰
 //
-// 两者之差就是「去重表清理」在每次发布上强加的成本。
+// 改造前这三个档位的 ns/op 差异巨大（阈值以上每次发布全表遍历）；
+// 改造后三者应基本持平。若再次出现随表规模上升，说明又引入了
+// 随表大小劣化的清理逻辑——本基准是它的回归哨兵。
 func BenchmarkPublishSeenTableCost(b *testing.B) {
-	for _, prefilled := range []int{1000, 20000} {
+	for _, prefilled := range []int{1000, 20000, 60000} {
 		b.Run(fmt.Sprintf("seen=%d", prefilled), func(b *testing.B) {
 			bus := New()
 			for i := 0; i < prefilled; i++ {
 				bus.Publish(benchEvent(i))
 			}
-			if got := bus.SeenLen(); got < prefilled {
-				b.Fatalf("prefill 未生效: seen=%d want>=%d", got, prefilled)
+			// 去重表有容量上限：填满后 SeenLen 停在 cap，不再等于 prefilled
+			want := prefilled
+			if lim := bus.SeenCap(); want > lim {
+				want = lim
+			}
+			if got := bus.SeenLen(); got != want {
+				b.Fatalf("prefill 未生效: seen=%d want=%d (cap=%d)", got, want, bus.SeenCap())
 			}
 
 			b.ReportAllocs()
@@ -153,13 +168,36 @@ func BenchmarkPublishSeenTableCost(b *testing.B) {
 	}
 }
 
+// BenchmarkPublishWithStore 测量启用持久化（EDU_EVENT_LOG）后发布路径的代价。
+//
+// 与 BenchmarkPublish 的差值 = 每次发布多出的「JSON 序列化 + 一次 write(2)」成本。
+// 这个数字是"持久化值不值"的核心依据，也是面试时要能报出来的取舍。
+func BenchmarkPublishWithStore(b *testing.B) {
+	store, err := OpenStore(filepath.Join(b.TempDir(), "bench-events.jsonl"))
+	if err != nil {
+		b.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	bus := New(WithStore(store))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bus.Publish(benchEvent(i))
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 观测量测试：不是断言正确性，而是把「看不见的资源增长」变成可记录的数字。
 // 这些用例永远通过，数据用 -v 查看，用于生成 docs/压测报告.md。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMeasureHistoryUnboundedGrowth 观测 history 只增不减导致的内存增长。
-func TestMeasureHistoryUnboundedGrowth(t *testing.T) {
+// TestMeasureHistoryBoundedGrowth 观测 history 的容量上限是否真正生效。
+//
+// 改造前这里是「只增不减」的观测：20000 事件 = 12.3 MB 且永不释放，
+// 外推 1000 万事件约 6.15 GB。改造后 history 是固定容量环形缓冲，
+// 因此本用例改为验证：无论发布多少，HistoryLen 都不超过 HistoryCap。
+func TestMeasureHistoryBoundedGrowth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过内存观测（-short）")
 	}
@@ -181,15 +219,20 @@ func TestMeasureHistoryUnboundedGrowth(t *testing.T) {
 	runtime.ReadMemStats(&after)
 
 	heapDelta := int64(after.HeapAlloc) - int64(before.HeapAlloc)
-	t.Logf("发布 %d 个事件：history=%d, seen=%d, 耗时=%v (%.0f events/s)",
-		events, bus.HistoryLen(), bus.SeenLen(), elapsed, float64(events)/elapsed.Seconds())
-	t.Logf("HeapAlloc 增量：%.2f MB（≈ %.0f bytes/事件，且永不释放）",
+	t.Logf("发布 %d 个事件：history=%d/%d, seen=%d/%d, 耗时=%v (%.0f events/s)",
+		events, bus.HistoryLen(), bus.HistoryCap(), bus.SeenLen(), bus.SeenCap(),
+		elapsed, float64(events)/elapsed.Seconds())
+	t.Logf("HeapAlloc 增量：%.2f MB（≈ %.0f bytes/事件）",
 		float64(heapDelta)/(1<<20), float64(heapDelta)/float64(events))
-	t.Logf("外推：1000 万事件后 history 常驻约 %.1f MB",
-		float64(heapDelta)/float64(events)*1e7/(1<<20))
+	t.Logf("内存上限：history 满 %d 条约 %.1f MB（不再随运行时间增长）",
+		bus.HistoryCap(), 645.0*float64(bus.HistoryCap())/(1<<20))
 
-	if bus.HistoryLen() != events {
-		t.Fatalf("history 未被记录: got %d want %d", bus.HistoryLen(), events)
+	want := events
+	if lim := bus.HistoryCap(); want > lim {
+		want = lim
+	}
+	if bus.HistoryLen() != want {
+		t.Fatalf("history 条数不符: got %d want %d (cap=%d)", bus.HistoryLen(), want, bus.HistoryCap())
 	}
 }
 

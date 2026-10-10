@@ -27,7 +27,23 @@ func main() {
 		log.SetOutput(io.Discard)
 	}
 
-	bus := eventbus.New()
+	// 事件持久化：设置 EDU_EVENT_LOG=<path> 后启用（append-only JSONL）；
+	// 未设置则纯内存运行，保持"零配置直接可跑"。
+	// 启用后进程重启会从日志回放历史（只填 history，不触发 handler）。
+	var busOpts []eventbus.Option
+	if path := os.Getenv("EDU_EVENT_LOG"); path != "" {
+		store, err := eventbus.OpenStore(path)
+		if err != nil {
+			log.Printf("[EventBus] persistence DISABLED: %v", err)
+		} else {
+			busOpts = append(busOpts, eventbus.WithStore(store))
+			log.Printf("[EventBus] persistence ENABLED: %s", path)
+		}
+	} else {
+		log.Println("[EventBus] persistence disabled (set EDU_EVENT_LOG=<path> to enable)")
+	}
+
+	bus := eventbus.New(busOpts...)
 
 	// 初始化RAG检索器与LLM客户端（无API Key时LLM为nil，Tutor自动降级模板回复）
 	retriever := rag.NewRetriever()

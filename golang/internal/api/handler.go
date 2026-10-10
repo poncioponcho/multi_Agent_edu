@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/multi-agent-education/golang/internal/agent"
@@ -85,6 +88,80 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retr
 		writeJSON(w, map[string]interface{}{"correlation_id": r.PathValue("correlationID"), "trace": trace})
 	})
 
+	// SSE 实时事件流：把某个 learner 的全部事件推给前端。
+	//
+	// 为什么需要它：`tutor.teaching_response`（教学内容）、`hint.response`（分级提示）、
+	// `engagement.encouragement`（鼓励）这 3 类是**终端事件**——面向学生的输出，
+	// 本就不该由其他 Agent 消费。此前它们发布后无人订阅，前端只能轮询
+	// `GET /api/v1/events/{learnerID}` 从内存 history 里捞（见手册 §Q3.5）。
+	// SSE 给它们一条真正的推送通道，把"轮询兜底"升级为"实时推送"。
+	//
+	// 注意：SSE 是长连接，若将来给 http.Server 设了 WriteTimeout 会把它掐断，
+	// 需要对该路径单独放宽（或改用 http.ResponseController 按请求设置超时）。
+	mux.HandleFunc("GET /api/v1/stream/{learnerID}", func(w http.ResponseWriter, r *http.Request) {
+		learnerID := r.PathValue("learnerID")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		// 每连接一个带缓冲的 channel：handler 只做**非阻塞投递**。
+		// 总线是所有 learner 共用的，一个慢客户端不该拖住它——
+		// 消费不过来就丢帧并计数，而不是阻塞 dispatch。
+		events := make(chan eventbus.Event, 64)
+		var dropped atomic.Int64
+
+		cancel := bus.SubscribeAll(func(e eventbus.Event) {
+			if e.LearnerID != learnerID {
+				return
+			}
+			select {
+			case events <- e:
+			default:
+				dropped.Add(1)
+			}
+		})
+		defer cancel() // 连接结束必须取消，否则订阅会随连接数累积而泄漏
+
+		// 心跳：防止中间代理（nginx 等）因长时间无数据而掐断连接
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				if n := dropped.Load(); n > 0 {
+					log.Printf("[SSE] learner=%s closed, dropped=%d frame(s)", learnerID, n)
+				}
+				return
+
+			case <-ticker.C:
+				if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+
+			case e := <-events:
+				data, err := json.Marshal(e)
+				if err != nil {
+					continue
+				}
+				if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data); err != nil {
+					return // 客户端已断开
+				}
+				flusher.Flush()
+			}
+		}
+	})
+
 	// RAG 检索：按知识点名称检索教材片段
 	mux.HandleFunc("GET /api/v1/retrieve", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
@@ -131,11 +208,14 @@ func SetupRouter(bus *eventbus.EventBus, assessment *agent.AssessmentAgent, retr
 			"gc_pause_total_ns": ms.PauseTotalNs,
 			"learners":          assessment.LearnerCount(),
 			"eventbus": map[string]interface{}{
-				"history_len": bus.HistoryLen(),
-				"seen_len":    bus.SeenLen(),
-				"queue_len":   bus.QueueLen(),
-				"queue_cap":   bus.QueueCap(),
-				"dropped":     bus.DroppedCount(),
+				"persist_enabled": bus.PersistEnabled(), // 是否启用 EDU_EVENT_LOG 持久化
+				"history_len":     bus.HistoryLen(),
+				"history_cap":     bus.HistoryCap(), // 环形缓冲上限（EDU_HISTORY_CAP 可覆盖）
+				"seen_len":        bus.SeenLen(),
+				"seen_cap":        bus.SeenCap(), // 去重表上限（EDU_SEEN_CAP 可覆盖）
+				"queue_len":       bus.QueueLen(),
+				"queue_cap":       bus.QueueCap(),
+				"dropped":         bus.DroppedCount(),
 			},
 		})
 	})

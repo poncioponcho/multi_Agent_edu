@@ -101,13 +101,18 @@ func WithLLM(c *llm.Client) TutorOption {
 type TutorAgent struct {
 	bus       *eventbus.EventBus
 	attempts  map[string]int
+	focus     map[string]string // learner -> 当前复习重点知识点（由 PathUpdated 驱动）
 	retriever *rag.BM25
 	llm       *llm.Client
 	mu        sync.Mutex
 }
 
 func NewTutorAgent(bus *eventbus.EventBus, opts ...TutorOption) *TutorAgent {
-	t := &TutorAgent{bus: bus, attempts: make(map[string]int)}
+	t := &TutorAgent{
+		bus:      bus,
+		attempts: make(map[string]int),
+		focus:    make(map[string]string),
+	}
 	for _, opt := range opts {
 		opt(t)
 	}
@@ -118,6 +123,7 @@ func (t *TutorAgent) Start() {
 	t.bus.Subscribe(eventbus.AssessmentComplete, t.handleAssessment)
 	t.bus.Subscribe(eventbus.EngagementAlert, t.handleEngagement)
 	t.bus.Subscribe(eventbus.StudentQuestion, t.handleQuestion)
+	t.bus.Subscribe(eventbus.PathUpdated, t.handlePathUpdated)
 }
 
 // handleQuestion 响应学生自由提问（POST /api/v1/question 入口）
@@ -280,11 +286,46 @@ func (t *TutorAgent) handleEngagement(event eventbus.Event) {
 		data["message"] = "让我给你一个更有挑战性的问题！"
 	}
 	if len(data) > 0 {
+		// 透传知识点：Curriculum 订阅 DifficultyAdjusted 后要据此调整该知识点的排期
+		data["knowledge_id"] = event.Data["knowledge_id"]
 		t.bus.PublishChild(event, eventbus.Event{
 			Type: eventbus.DifficultyAdjusted, Source: "TutorAgent",
 			LearnerID: event.LearnerID, Data: data,
 		})
 	}
+}
+
+// handlePathUpdated 课程路径更新后记录当前教学重点。
+//
+// 语义：Curriculum 检测到薄弱点后会把该知识点标为复习重点，
+// Tutor 据此在后续教学回复中优先强化它。
+//
+// ★ 只更新内部状态、不再向下发事件：Tutor 已订阅 PathUpdated，
+// 若这里再发事件、而 Curriculum 又订阅了 Tutor 的 DifficultyAdjusted，
+// 两者就会形成事件环（当前靠去重与 MaxHops 兜底，但不该依赖兜底）。
+func (t *TutorAgent) handlePathUpdated(event eventbus.Event) {
+	weakID, _ := event.Data["weak_knowledge_id"].(string)
+	reason, _ := event.Data["reason"].(string)
+	if weakID == "" {
+		return
+	}
+
+	t.mu.Lock()
+	if t.focus == nil {
+		t.focus = make(map[string]string)
+	}
+	t.focus[event.LearnerID] = weakID
+	t.mu.Unlock()
+
+	log.Printf("[Tutor] path updated learner=%s reason=%s focus=%s",
+		event.LearnerID, reason, weakID)
+}
+
+// focusKnowledge 返回该 learner 当前的复习重点（无则返回空串）。
+func (t *TutorAgent) focusKnowledge(learnerID string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.focus[learnerID]
 }
 
 // ─── Curriculum Agent ───
@@ -302,6 +343,7 @@ func NewCurriculumAgent(bus *eventbus.EventBus) *CurriculumAgent {
 func (c *CurriculumAgent) Start() {
 	c.bus.Subscribe(eventbus.MasteryUpdated, c.handleMasteryUpdate)
 	c.bus.Subscribe(eventbus.WeaknessDetected, c.handleWeakness)
+	c.bus.Subscribe(eventbus.DifficultyAdjusted, c.handleDifficultyAdjusted)
 }
 
 func (c *CurriculumAgent) handleMasteryUpdate(event eventbus.Event) {
@@ -336,6 +378,43 @@ func (c *CurriculumAgent) handleWeakness(event eventbus.Event) {
 			"message":           "检测到薄弱知识点，建议先复习前置知识",
 		},
 	})
+}
+
+// handleDifficultyAdjusted 难度被 Tutor 调整后，同步调整该知识点的复习排期。
+//
+// 语义：Tutor 因挫败降难度 → 该知识点需要更多巩固，视为一次低质量回顾
+// （SM-2 会缩短下次间隔）；因厌倦升难度 → 掌握较好，视为高质量回顾。
+//
+// ★ 只更新内部排期、不再向下发事件：Tutor 已订阅 PathUpdated，
+// 若这里再发 PathUpdated，就会与 Tutor 的 DifficultyAdjusted 形成事件环。
+func (c *CurriculumAgent) handleDifficultyAdjusted(event eventbus.Event) {
+	knowledgeID, _ := event.Data["knowledge_id"].(string)
+	action, _ := event.Data["action"].(string)
+	if knowledgeID == "" {
+		return
+	}
+
+	c.mu.Lock()
+	items, ok := c.reviewItems[event.LearnerID]
+	if !ok {
+		items = make(map[string]*model.ReviewItem)
+		c.reviewItems[event.LearnerID] = items
+	}
+	item, ok := items[knowledgeID]
+	if !ok {
+		item = model.NewReviewItem(knowledgeID)
+		items[knowledgeID] = item
+	}
+	c.mu.Unlock()
+
+	quality := 2 // decrease：低质量回顾 → 间隔回退
+	if action == "increase" {
+		quality = 5 // increase：高质量回顾 → 间隔前进
+	}
+	model.SM2Review(item, quality)
+
+	log.Printf("[Curriculum] difficulty adjusted learner=%s kp=%s action=%s -> EF=%.2f interval=%.1fd",
+		event.LearnerID, knowledgeID, action, item.EasinessFactor, item.IntervalDays)
 }
 
 func masteryToQuality(mastery float64) int {
@@ -469,6 +548,8 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 			Data: map[string]interface{}{
 				"alert_type": "frustration",
 				"message":    "别灰心！犯错是学习的一部分。",
+				// 带上知识点：Tutor 调整难度、Curriculum 调整复习排期都要用它定位
+				"knowledge_id": event.Data["knowledge_id"],
 			},
 		})
 	} else if snap.consecutiveCorrect >= 5 {
@@ -481,6 +562,8 @@ func (e *EngagementAgent) analyze(event eventbus.Event) {
 					Data: map[string]interface{}{
 						"alert_type": "boredom",
 						"message":    "你表现非常棒！让我们挑战更难的内容！",
+						// 同 frustration 分支：下游需要知识点才能定位
+						"knowledge_id": event.Data["knowledge_id"],
 					},
 				})
 			}
